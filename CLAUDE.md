@@ -15,14 +15,24 @@ Git worktree management for parallel Claude sessions.
 
 ## Slot (numbered, cross-project)
 
+Powered by `slot-cli` (Go binary at `~/bin/slot-cli`).
+
 | Command | Where | What |
 |---------|-------|------|
-| `xc slot init <port>` | main repo | Register project base port |
-| `xc slot new [N]` | main repo | Create slot (auto-increments) |
+| `xc slot new [N]` | main repo | Create slot with port allocation + DB clone |
 | `xc slot start` | slot dir | Fresh Claude session |
 | `xc slot continue` | slot dir | Resume last session |
 | `xc slot delete <N>` | main repo | Delete slot |
+| `xc slot list` | anywhere | Show running Claude instances |
 | `xc slot check` | slot dir | Validate slot config |
+
+**Auto features:**
+- Scans `.env` files for ports, allocates slot-specific ports
+- Updates `docker-compose.yml` container names
+- Starts docker and clones database from main
+- Checks port availability before allocation
+
+See `docs/multi-slot-requirements.md` for project setup.
 
 ## Clean (safe cleanup)
 

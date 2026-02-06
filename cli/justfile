@@ -277,6 +277,10 @@ ws *args:
     just --justfile ~/.config/just/justfile --working-directory . workspace {{args}}
 
 slot *args:
+    ~/bin/slot-cli {{args}}
+
+# Legacy slot implementation (replaced by slot-cli)
+slot-legacy *args:
     #!/bin/bash
     set -e
 
@@ -513,59 +517,99 @@ slot *args:
                 echo "✓ Copied gitignored files"
             fi
 
-            # Generate slot-specific ports for all .env* files (skip in mirror mode)
-            # Check for docker-compose anywhere in the project
-            has_docker=$(find "$fullpath" -name "docker-compose.yml" -o -name "docker-compose.yaml" 2>/dev/null | head -1)
-            if [ -n "$has_docker" ] && [ "$mirror_mode" = false ]; then
+            # Generate slot-specific ports by reading main's .env files
+            if [ "$mirror_mode" = false ]; then
                 docker_name=$(echo "$slot_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
-                pg_port=$((5432 + project_offset + slot_num))
-                pg_o11y_port=$((5434 + project_offset + slot_num))
-                redis_port=$((6379 + project_offset + slot_num))
-                minio_port=$((9000 + project_offset + slot_num))
-                minio_web_port=$((9001 + project_offset + slot_num))
-                next_port=$((base_port + slot_num))
 
-                # Find all .env* files: root, apps/, and dirs with docker-compose
-                env_files=""
-                # Root level
-                for f in $(find "$fullpath" -maxdepth 1 -name ".env*" -type f 2>/dev/null); do
-                    env_files="$env_files $f"
+                # Collect ALL .env files from main repo
+                main_env_files=""
+                for f in $(find "$main_repo" -name ".env*" -type f \
+                    -not -path "*/node_modules/*" \
+                    -not -path "*/.next/*" \
+                    -not -path "*/dist/*" \
+                    -not -path "*/.git/*" 2>/dev/null); do
+                    main_env_files="$main_env_files $f"
                 done
-                # apps/*
-                for f in $(find "$fullpath/apps" -maxdepth 2 -name ".env*" -type f 2>/dev/null); do
-                    env_files="$env_files $f"
-                done
-                # directories with docker-compose
-                for compose in $(find "$fullpath" -name "docker-compose.yml" -o -name "docker-compose.yaml" 2>/dev/null); do
-                    compose_dir=$(dirname "$compose")
-                    for f in $(find "$compose_dir" -maxdepth 1 -name ".env*" -type f 2>/dev/null); do
-                        # Avoid duplicates
-                        echo "$env_files" | grep -q "$f" || env_files="$env_files $f"
+
+                # Extract all unique ports from main's .env files
+                # Format: VAR_NAME=PORT or localhost:PORT patterns
+                declare -A port_map  # main_port -> slot_port
+
+                echo "Scanning main project ports..."
+                for env_file in $main_env_files; do
+                    [ ! -f "$env_file" ] && continue
+
+                    # Extract PORT= and *_PORT= variables
+                    while IFS='=' read -r var_name var_value; do
+                        # Skip comments and empty lines
+                        [[ "$var_name" =~ ^# ]] && continue
+                        [[ -z "$var_name" ]] && continue
+
+                        # Check if it's a port variable
+                        if [[ "$var_name" =~ _PORT$ ]] || [[ "$var_name" == "PORT" ]]; then
+                            # Clean the value (remove quotes, whitespace)
+                            port_val=$(echo "$var_value" | tr -d '"' | tr -d "'" | tr -d ' ')
+                            if [[ "$port_val" =~ ^[0-9]+$ ]] && [ "$port_val" -gt 1000 ]; then
+                                if [ -z "${port_map[$port_val]}" ]; then
+                                    # Calculate slot port and check availability
+                                    slot_port=$((port_val + slot_num))
+                                    while lsof -i :$slot_port >/dev/null 2>&1; do
+                                        echo "  Port $slot_port in use, trying next..."
+                                        slot_port=$((slot_port + 1))
+                                    done
+                                    port_map[$port_val]=$slot_port
+                                    echo "  $var_name: $port_val → $slot_port"
+                                fi
+                            fi
+                        fi
+                    done < "$env_file"
+
+                    # Also extract ports from URLs (localhost:PORT patterns)
+                    for port_val in $(grep -oE 'localhost:[0-9]+' "$env_file" 2>/dev/null | cut -d: -f2 | sort -u); do
+                        if [ "$port_val" -gt 1000 ] && [ -z "${port_map[$port_val]}" ]; then
+                            slot_port=$((port_val + slot_num))
+                            while lsof -i :$slot_port >/dev/null 2>&1; do
+                                slot_port=$((slot_port + 1))
+                            done
+                            port_map[$port_val]=$slot_port
+                            echo "  URL port: $port_val → $slot_port"
+                        fi
                     done
                 done
 
-                for env_file in $env_files; do
+                # Now update ALL .env files in the slot
+                slot_env_files=""
+                for f in $(find "$fullpath" -name ".env*" -type f \
+                    -not -path "*/node_modules/*" \
+                    -not -path "*/.next/*" \
+                    -not -path "*/dist/*" \
+                    -not -path "*/.git/*" 2>/dev/null); do
+                    slot_env_files="$slot_env_files $f"
+                done
+
+                echo ""
+                echo "Updating slot .env files..."
+                for env_file in $slot_env_files; do
                     [ ! -f "$env_file" ] && continue
-
-                    # Replace port values in existing env files
-                    sed -i '' "s/^PORT=.*/PORT=$next_port/" "$env_file" 2>/dev/null || true
-                    sed -i '' "s/^POSTGRES_PORT=.*/POSTGRES_PORT=$pg_port/" "$env_file" 2>/dev/null || true
-                    sed -i '' "s/^O11Y_POSTGRES_PORT=.*/O11Y_POSTGRES_PORT=$pg_o11y_port/" "$env_file" 2>/dev/null || true
-                    sed -i '' "s/^REDIS_PORT=.*/REDIS_PORT=$redis_port/" "$env_file" 2>/dev/null || true
-                    sed -i '' "s/^MINIO_PORT=.*/MINIO_PORT=$minio_port/" "$env_file" 2>/dev/null || true
-                    sed -i '' "s/^MINIO_WEB_PORT=.*/MINIO_WEB_PORT=$minio_web_port/" "$env_file" 2>/dev/null || true
-                    sed -i '' "s|^MINIO_ENDPOINT=.*|MINIO_ENDPOINT=http://localhost:$minio_port|" "$env_file" 2>/dev/null || true
-                    sed -i '' "s/^COMPOSE_PROJECT_NAME=.*/COMPOSE_PROJECT_NAME=$docker_name/" "$env_file" 2>/dev/null || true
-                    sed -i '' "s|localhost:5432|localhost:$pg_port|g" "$env_file" 2>/dev/null || true
-                    sed -i '' "s|localhost:5433|localhost:$pg_port|g" "$env_file" 2>/dev/null || true
-                    sed -i '' "s|localhost:6379|localhost:$redis_port|g" "$env_file" 2>/dev/null || true
-                    sed -i '' "s|localhost:3000|localhost:$next_port|g" "$env_file" 2>/dev/null || true
-
                     rel_path=$(echo "$env_file" | sed "s|$fullpath/||")
+
+                    # Replace COMPOSE_PROJECT_NAME
+                    sed -i '' "s/^COMPOSE_PROJECT_NAME=.*/COMPOSE_PROJECT_NAME=$docker_name/" "$env_file" 2>/dev/null || true
+
+                    # Replace each discovered port with its slot equivalent
+                    for main_port in "${!port_map[@]}"; do
+                        slot_port="${port_map[$main_port]}"
+                        # Replace in variable values (PORT=XXXX, *_PORT=XXXX)
+                        sed -i '' "s/=${main_port}$/=${slot_port}/" "$env_file" 2>/dev/null || true
+                        sed -i '' "s/=\"${main_port}\"/=\"${slot_port}\"/" "$env_file" 2>/dev/null || true
+                        # Replace in URLs (localhost:XXXX)
+                        sed -i '' "s|localhost:${main_port}|localhost:${slot_port}|g" "$env_file" 2>/dev/null || true
+                    done
+
                     echo "  Updated: $rel_path"
                 done
 
-                echo "✓ Updated .env files (port: $next_port, pg: $pg_port)"
+                echo "✓ Port mapping complete"
             fi
 
             # Install dependencies
@@ -664,10 +708,21 @@ slot *args:
             ;;
 
         "delete"|"rm"|"kill")
-            slot_num="$arg2"
+            slot_num=""
+            force_delete=false
+
+            # Parse arguments
+            for arg in $full_args; do
+                case "$arg" in
+                    "delete"|"rm"|"kill") ;;
+                    --force|-f) force_delete=true ;;
+                    [0-9]*) [ -z "$slot_num" ] && slot_num="$arg" ;;
+                esac
+            done
+
             if [ -z "$slot_num" ]; then
                 echo "Error: need slot number"
-                echo "Usage: jg slot delete <number>"
+                echo "Usage: jg slot delete <number> [--force]"
                 exit 1
             fi
 
@@ -681,10 +736,10 @@ slot *args:
 
             # Check for uncommitted changes
             changes=$(git -C "$fullpath" status --porcelain 2>/dev/null)
-            if [ -n "$changes" ]; then
+            if [ -n "$changes" ] && [ "$force_delete" = false ]; then
                 echo "Warning: Slot has uncommitted changes"
-                read -p "Delete anyway? [y/N] " confirm
-                [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 1
+                echo "Use --force to delete anyway"
+                exit 1
             fi
 
             # Stop docker if running

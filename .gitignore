@@ -1,3 +1,26 @@
 node_modules/
 .DS_Store
 *.log
+
+# Environment files
+.env
+.env.local
+.env*.local
+
+# Next.js
+.next/
+out/
+
+# Build
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# Temp
+*.png
+*.tmp
+
+# Go binaries
+cli/slot-cli/slot-cli
