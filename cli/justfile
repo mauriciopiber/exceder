@@ -1,0 +1,1087 @@
+# Global justfile
+
+workspace *args:
+    #!/bin/bash
+    set -e
+    full_args="{{args}}"
+    cmd=$(echo "$full_args" | awk '{print $1}')
+    arg2=$(echo "$full_args" | awk '{print $2}')
+    force=$(echo "$full_args" | grep -q "\-\-force" && echo "yes" || echo "no")
+
+    if [ -f ".git" ]; then
+        in_worktree="yes"
+        branch_name=$(git branch --show-current)
+        main_repo=$(cat .git | sed 's/gitdir: //' | sed 's/\/.git\/worktrees.*//')
+        project=$(basename "$main_repo")
+    else
+        in_worktree="no"
+        branch_name=""
+        project=$(basename $(pwd))
+        main_repo=$(pwd)
+    fi
+
+    case "$cmd" in
+        "list")
+            git worktree list
+            ;;
+        "new")
+            name="$arg2"
+            if [ -z "$name" ]; then
+                echo "Error: need a name"
+                exit 1
+            fi
+            git worktree add "../${project}-ws-${name}" -b "${name}"
+            fullpath=$(cd "../${project}-ws-${name}" && pwd)
+            mainpath=$(pwd)
+            echo "Created ${fullpath}"
+
+            echo "Copying gitignored files..."
+            cd "$mainpath"
+            for f in $(git ls-files --others --ignored --exclude-standard); do
+                [ -d "$mainpath/$f" ] && continue
+                [[ "$f" == *node_modules* ]] && continue
+                [[ "$f" == *dist/* ]] && continue
+                [[ "$f" == *build/* ]] && continue
+                [[ "$f" == *.next/* ]] && continue
+                [[ "$f" == *.log ]] && continue
+                [[ "$f" == *.husky/* ]] && continue
+                [[ "$f" == *backups/* ]] && continue
+                [[ "$f" == *.turbo/* ]] && continue
+                [[ "$f" == *.venv/* ]] && continue
+                [[ "$f" == *.trunk/* ]] && continue
+                [[ "$f" == *coverage/* ]] && continue
+                if [ -f "$mainpath/$f" ]; then
+                    size=$(stat -f%z "$mainpath/$f" 2>/dev/null || echo "0")
+                    if [ "$size" -lt 1048576 ]; then
+                        mkdir -p "$fullpath/$(dirname "$f")"
+                        cp "$mainpath/$f" "$fullpath/$f" 2>/dev/null && echo "  Copied $f"
+                    fi
+                fi
+            done
+
+            if [ -f "$fullpath/docker-compose.yml" ] || [ -f "$fullpath/docker-compose.yaml" ]; then
+                echo "Docker project detected..."
+                offset=$(($(git worktree list | wc -l | tr -d ' ') * 10))
+                docker_name=$(echo "$project-$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+                pg_port=$((5432 + offset))
+                pg_o11y_port=$((5434 + offset))
+                redis_port=$((6379 + offset))
+                minio_port=$((9000 + offset))
+                minio_web_port=$((9001 + offset))
+                next_port=$((3000 + offset))
+                
+                printf '%s\n' \
+                    "# Auto-generated for worktree: $name" \
+                    "# Port offset: $offset" \
+                    "COMPOSE_PROJECT_NAME=$docker_name" \
+                    "POSTGRES_PORT=$pg_port" \
+                    "O11Y_POSTGRES_PORT=$pg_o11y_port" \
+                    "REDIS_PORT=$redis_port" \
+                    "MINIO_PORT=$minio_port" \
+                    "MINIO_WEB_PORT=$minio_web_port" \
+                    "MINIO_ENDPOINT=http://localhost:$minio_port" \
+                    "PORT=$next_port" \
+                    "" \
+                    "# Database connection" \
+                    "DATABASE_URL=postgresql://postgres:postgres@localhost:$pg_port/postgres" \
+                    "" \
+                    "# Redis connection" \
+                    "REDIS_URL=redis://localhost:$redis_port" \
+                    > "$fullpath/.env.local"
+                echo "  Generated .env.local (port offset: +$offset)"
+                
+                if [ -d "$fullpath/apps" ]; then
+                    for app_dir in "$fullpath/apps"/*/; do
+                        if [ -d "$app_dir" ]; then
+                            cp "$fullpath/.env.local" "${app_dir}.env.local"
+                            echo "  Copied .env.local to $(basename $app_dir)"
+                        fi
+                    done
+                fi
+            fi
+
+            echo "Installing dependencies..."
+            cd "$fullpath"
+            for lockfile in $(find . -name "pnpm-lock.yaml" -not -path "*/node_modules/*"); do
+                dir=$(dirname "$lockfile")
+                echo "  Installing in $dir..."
+                (cd "$dir" && pnpm install --frozen-lockfile)
+            done
+            cd "$mainpath"
+
+            echo ""
+            echo "cd ${fullpath}" | pbcopy
+            echo "→ Cmd+T, Cmd+V, Enter"
+            if [ -f "$fullpath/docker-compose.yml" ] || [ -f "$fullpath/docker-compose.yaml" ]; then
+                echo "→ Then: jg workspace docker up"
+                echo "→ Optional: jg workspace docker clone"
+            fi
+            echo "→ Then: jg workspace start"
+            ;;
+        "docker")
+            subcmd="$arg2"
+            if [ "$in_worktree" != "yes" ]; then
+                echo "Error: run from worktree"
+                exit 1
+            fi
+            if [ ! -f "docker-compose.yml" ] && [ ! -f "docker-compose.yaml" ]; then
+                echo "Error: no docker-compose.yml"
+                exit 1
+            fi
+            case "$subcmd" in
+                "up")
+                    if [ -f ".env.local" ]; then
+                        docker compose --env-file .env --env-file .env.local up -d
+                        echo "Ports:"
+                        grep "_PORT=\|_URL=" .env.local | grep -v "^#"
+                    else
+                        docker compose up -d
+                    fi
+                    ;;
+                "down")
+                    if [ -f ".env.local" ]; then
+                        docker compose --env-file .env --env-file .env.local down
+                    else
+                        docker compose down
+                    fi
+                    ;;
+                "nuke")
+                    if [ -f ".env.local" ]; then
+                        docker compose --env-file .env --env-file .env.local down -v
+                    else
+                        docker compose down -v
+                    fi
+                    ;;
+                "clone")
+                    wt_pg_port=$(grep "^POSTGRES_PORT=" .env.local | cut -d= -f2)
+                    echo "Cloning DB from main (5432) to worktree ($wt_pg_port)..."
+                    
+                    # Check if main db is accessible
+                    if ! PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -c "SELECT 1" postgres >/dev/null 2>&1; then
+                        echo "Error: Main DB on port 5432 not accessible. Start main docker first:"
+                        echo "  cd $main_repo && docker compose up -d"
+                        exit 1
+                    fi
+                    
+                    # Check if worktree db is accessible
+                    if ! PGPASSWORD=postgres psql -h localhost -p "$wt_pg_port" -U postgres -c "SELECT 1" postgres >/dev/null 2>&1; then
+                        echo "Error: Worktree DB on port $wt_pg_port not accessible. Run: jg workspace docker up"
+                        exit 1
+                    fi
+                    
+                    # Count tables in source
+                    src_tables=$(PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -t -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'" postgres | tr -d ' ')
+                    echo "Source DB has $src_tables tables in public schema"
+                    
+                    if [ "$src_tables" = "0" ]; then
+                        echo "Warning: Source DB is empty. Nothing to clone."
+                        exit 0
+                    fi
+                    
+                    echo "Cloning..."
+                    PGPASSWORD=postgres pg_dump -h localhost -p 5432 -U postgres postgres 2>/dev/null | \
+                    PGPASSWORD=postgres psql -h localhost -p "$wt_pg_port" -U postgres postgres >/dev/null 2>&1
+                    
+                    # Verify
+                    dst_tables=$(PGPASSWORD=postgres psql -h localhost -p "$wt_pg_port" -U postgres -t -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'" postgres | tr -d ' ')
+                    echo "Done. Worktree DB now has $dst_tables tables"
+                    ;;
+                "ps")
+                    if [ -f ".env.local" ]; then
+                        docker compose --env-file .env --env-file .env.local ps
+                    else
+                        docker compose ps
+                    fi
+                    ;;
+                *)
+                    echo "Usage: docker [up|down|nuke|clone|ps]"
+                    ;;
+            esac
+            ;;
+        "start")
+            claude --dangerously-skip-permissions
+            ;;
+        "continue")
+            claude --continue --dangerously-skip-permissions
+            ;;
+        "done")
+            if [ "$in_worktree" = "yes" ]; then
+                wt_path=$(pwd)
+                name="$branch_name"
+                docker compose --env-file .env --env-file .env.local down -v 2>/dev/null || true
+            else
+                name="$arg2"
+                wt_path="${main_repo}-ws-${name}"
+            fi
+            changes=$(cd "$wt_path" && git status --porcelain)
+            if [ -n "$changes" ] && [ "$force" != "yes" ]; then
+                echo "Error: uncommitted changes. Use --force"
+                exit 1
+            fi
+            cd "$main_repo"
+            git merge "${name}"
+            git worktree remove "$wt_path" --force
+            git branch -d "${name}"
+            echo "Merged ${name}"
+            ;;
+        "merge")
+            other_branch="$arg2"
+            if [ -z "$other_branch" ]; then
+                echo "Error: need branch name to merge"
+                echo "Usage: jg workspace merge <branch-name>"
+                exit 1
+            fi
+            if [ "$in_worktree" != "yes" ]; then
+                echo "Error: run from a worktree"
+                exit 1
+            fi
+            echo "Merging ${other_branch} into ${branch_name}..."
+            git merge "${other_branch}"
+            echo "Done. ${other_branch} merged into ${branch_name}"
+            ;;
+        "pr")
+            if [ "$in_worktree" = "yes" ]; then
+                name="$branch_name"
+            else
+                name="$arg2"
+                cd "${main_repo}-ws-${name}"
+            fi
+            git push -u origin "${name}"
+            gh pr create --fill
+            ;;
+        "kill")
+            if [ "$in_worktree" = "yes" ]; then
+                wt_path=$(pwd)
+                name="$branch_name"
+                docker compose --env-file .env --env-file .env.local down -v 2>/dev/null || true
+            else
+                name="$arg2"
+                wt_path="${main_repo}-ws-${name}"
+            fi
+            changes=$(cd "$wt_path" && git status --porcelain)
+            if [ -n "$changes" ] && [ "$force" != "yes" ]; then
+                echo "Error: uncommitted changes. Use --force"
+                exit 1
+            fi
+            cd "$main_repo"
+            git worktree remove "$wt_path" --force
+            git branch -D "${name}"
+            echo "Killed ${name}"
+            ;;
+        *)
+            echo "workspace [list|new|docker|start|continue|merge|done|pr|kill]"
+            ;;
+    esac
+
+ws *args:
+    just --justfile ~/.config/just/justfile --working-directory . workspace {{args}}
+
+slot *args:
+    #!/bin/bash
+    set -e
+
+    REGISTRY="$HOME/.config/slots/registry.json"
+    mkdir -p "$(dirname "$REGISTRY")"
+    [ -f "$REGISTRY" ] || echo '{"projects":{},"slots":{}}' > "$REGISTRY"
+
+    full_args="{{args}}"
+    cmd=$(echo "$full_args" | awk '{print $1}')
+    arg2=$(echo "$full_args" | awk '{print $2}')
+    arg3=$(echo "$full_args" | awk '{print $3}')
+
+    # Detect if in worktree or main repo
+    if [ -f ".git" ]; then
+        main_repo=$(cat .git | sed 's/gitdir: //' | sed 's/\/.git\/worktrees.*//')
+        project=$(basename "$main_repo")
+    else
+        project=$(basename $(pwd))
+        main_repo=$(pwd)
+    fi
+
+    # Helper to get project base port from registry
+    get_base_port() {
+        local proj="$1"
+        local bp=$(jq -r ".projects[\"$proj\"].base_port // empty" "$REGISTRY" 2>/dev/null)
+        if [ -z "$bp" ]; then
+            echo ""
+        else
+            echo "$bp"
+        fi
+    }
+
+    case "$cmd" in
+        "init")
+            base_port=""
+            # Parse --base-port argument
+            for arg in $full_args; do
+                case "$arg" in
+                    --base-port=*) base_port="${arg#*=}" ;;
+                esac
+            done
+            # Also check positional arg2
+            if [ -z "$base_port" ] && [[ "$arg2" =~ ^[0-9]+$ ]]; then
+                base_port="$arg2"
+            fi
+
+            if [ -z "$base_port" ]; then
+                echo "Error: need base port"
+                echo "Usage: jg slot init --base-port=3000"
+                echo "   or: jg slot init 3000"
+                exit 1
+            fi
+
+            # Validate port range
+            if [ "$base_port" -lt 1000 ] || [ "$base_port" -gt 60000 ]; then
+                echo "Error: base port should be between 1000-60000"
+                exit 1
+            fi
+
+            # Check for conflicts with other projects
+            conflict=$(jq -r ".projects | to_entries[] | select(.value.base_port == $base_port) | .key" "$REGISTRY" 2>/dev/null)
+            if [ -n "$conflict" ] && [ "$conflict" != "$project" ]; then
+                echo "Error: base port $base_port already used by $conflict"
+                exit 1
+            fi
+
+            # Register project
+            tmp=$(mktemp)
+            jq --arg proj "$project" --argjson port "$base_port" \
+               '.projects[$proj] = {base_port: $port, path: "'"$main_repo"'"}' \
+               "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+
+            project_offset=$(( (base_port - 3000) / 10 ))
+            echo "✓ Registered $project with base_port=$base_port"
+            echo ""
+            echo "Port allocation for slots:"
+            echo "  Slot 1  → PORT=$((base_port + 1)), PG=$((5432 + project_offset + 1))"
+            echo "  Slot 10 → PORT=$((base_port + 10)), PG=$((5432 + project_offset + 10))"
+            ;;
+
+        "list"|"ls"|"")
+            echo "╔══════════════════════════════════════════════════════════════════╗"
+            echo "║                    CLAUDE INSTANCES                              ║"
+            echo "╚══════════════════════════════════════════════════════════════════╝"
+            echo ""
+
+            for pid in $(pgrep -f "claude" 2>/dev/null); do
+                cwd=$(lsof -p "$pid" 2>/dev/null | grep cwd | awk '{print $NF}')
+                [ -z "$cwd" ] && continue
+
+                proj=$(basename "$cwd")
+                branch=$(git -C "$cwd" branch --show-current 2>/dev/null || echo "-")
+                runtime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs)
+
+                # Get session info
+                project_key=$(echo "$cwd" | sed 's|/|-|g')
+                session_dir="$HOME/.claude/projects/$project_key"
+                session_file=$(ls -t "$session_dir"/*.jsonl 2>/dev/null | head -1)
+
+                slug=""
+                model=""
+                if [ -f "$session_file" ]; then
+                    slug=$(grep -o '"slug":"[^"]*"' "$session_file" 2>/dev/null | tail -1 | cut -d'"' -f4)
+                    model=$(grep -o '"model":"[^"]*"' "$session_file" 2>/dev/null | tail -1 | cut -d'"' -f4 | sed 's/claude-//' | sed 's/-20251101//')
+                fi
+
+                echo "┌─ $proj"
+                echo "│  Branch:  $branch"
+                echo "│  Session: ${slug:-unknown}"
+                echo "│  Model:   ${model:-unknown}"
+                echo "│  Runtime: ${runtime:-unknown}"
+                echo "└──────────────────────────────────────"
+                echo ""
+            done
+
+            if [ -z "$(pgrep -f "claude" 2>/dev/null)" ]; then
+                echo "No Claude instances running."
+            fi
+            ;;
+
+        "new"|"create")
+            slot_num=""
+            mirror_mode=false
+
+            # Parse arguments
+            for arg in $full_args; do
+                case "$arg" in
+                    --mirror) mirror_mode=true ;;
+                    [0-9]*) [ -z "$slot_num" ] && slot_num="$arg" ;;
+                esac
+            done
+
+            # Auto-increment if no number given
+            if [ -z "$slot_num" ]; then
+                existing=$(ls -d "../${project}-"[0-9]* 2>/dev/null | sed "s|.*${project}-||" | sort -n | tail -1)
+                if [ -z "$existing" ]; then
+                    slot_num=1
+                else
+                    slot_num=$((existing + 1))
+                fi
+                echo "Auto-assigned slot: $slot_num"
+            fi
+
+            # Validate number
+            if ! [[ "$slot_num" =~ ^[0-9]+$ ]]; then
+                echo "Error: slot number must be a number (got: $slot_num)"
+                exit 1
+            fi
+
+            slot_name="${project}-${slot_num}"
+            branch_name="slot-${slot_num}"
+            fullpath=$(cd .. && pwd)/${slot_name}
+
+            # Check if exists
+            if [ -d "$fullpath" ]; then
+                echo "Error: Slot $slot_name already exists at $fullpath"
+                exit 1
+            fi
+
+            # Get project base port (or default to 3000)
+            base_port=$(get_base_port "$project")
+            if [ -z "$base_port" ]; then
+                base_port=3000
+                echo "Note: No base port registered. Using default 3000."
+                echo "  Run 'jg slot init <base_port>' to set project base port."
+                echo ""
+            fi
+
+            # Calculate project offset for other services
+            # This ensures different projects don't collide on pg/redis/etc
+            project_offset=$(( (base_port - 3000) / 10 ))
+
+            echo "Creating slot: $slot_name"
+            echo ""
+
+            # Create worktree
+            git worktree add "$fullpath" -b "$branch_name"
+            echo "✓ Created worktree"
+
+            # Handle gitignored files based on mode
+            if [ "$mirror_mode" = true ]; then
+                echo "Mirror mode: symlinking .env files..."
+                for f in $(git ls-files --others --ignored --exclude-standard); do
+                    [ -d "$main_repo/$f" ] && continue
+                    [[ "$f" == *node_modules* ]] && continue
+                    [[ "$f" == *dist/* ]] && continue
+                    [[ "$f" == *build/* ]] && continue
+                    [[ "$f" == *.next/* ]] && continue
+                    [[ "$f" == *.log ]] && continue
+                    [[ "$f" == *.husky/* ]] && continue
+                    [[ "$f" == *backups/* ]] && continue
+                    [[ "$f" == *.turbo/* ]] && continue
+                    [[ "$f" == *.venv/* ]] && continue
+                    [[ "$f" == *.trunk/* ]] && continue
+                    [[ "$f" == *coverage/* ]] && continue
+                    if [ -f "$main_repo/$f" ]; then
+                        size=$(stat -f%z "$main_repo/$f" 2>/dev/null || echo "0")
+                        if [ "$size" -lt 1048576 ]; then
+                            mkdir -p "$fullpath/$(dirname "$f")"
+                            # Symlink .env* files, copy everything else
+                            if [[ "$f" == *.env* ]] || [[ "$f" == */.env* ]]; then
+                                ln -sf "$main_repo/$f" "$fullpath/$f"
+                                echo "  Symlinked: $f"
+                            else
+                                cp "$main_repo/$f" "$fullpath/$f" 2>/dev/null || true
+                            fi
+                        fi
+                    fi
+                done
+                echo "✓ Symlinked .env files (mirror mode)"
+            else
+                echo "Copying gitignored files..."
+                for f in $(git ls-files --others --ignored --exclude-standard); do
+                    [ -d "$main_repo/$f" ] && continue
+                    [[ "$f" == *node_modules* ]] && continue
+                    [[ "$f" == *dist/* ]] && continue
+                    [[ "$f" == *build/* ]] && continue
+                    [[ "$f" == *.next/* ]] && continue
+                    [[ "$f" == *.log ]] && continue
+                    [[ "$f" == *.husky/* ]] && continue
+                    [[ "$f" == *backups/* ]] && continue
+                    [[ "$f" == *.turbo/* ]] && continue
+                    [[ "$f" == *.venv/* ]] && continue
+                    [[ "$f" == *.trunk/* ]] && continue
+                    [[ "$f" == *coverage/* ]] && continue
+                    if [ -f "$main_repo/$f" ]; then
+                        size=$(stat -f%z "$main_repo/$f" 2>/dev/null || echo "0")
+                        if [ "$size" -lt 1048576 ]; then
+                            mkdir -p "$fullpath/$(dirname "$f")"
+                            cp "$main_repo/$f" "$fullpath/$f" 2>/dev/null || true
+                        fi
+                    fi
+                done
+                echo "✓ Copied gitignored files"
+            fi
+
+            # Generate slot-specific ports for all .env* files (skip in mirror mode)
+            # Check for docker-compose anywhere in the project
+            has_docker=$(find "$fullpath" -name "docker-compose.yml" -o -name "docker-compose.yaml" 2>/dev/null | head -1)
+            if [ -n "$has_docker" ] && [ "$mirror_mode" = false ]; then
+                docker_name=$(echo "$slot_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+                pg_port=$((5432 + project_offset + slot_num))
+                pg_o11y_port=$((5434 + project_offset + slot_num))
+                redis_port=$((6379 + project_offset + slot_num))
+                minio_port=$((9000 + project_offset + slot_num))
+                minio_web_port=$((9001 + project_offset + slot_num))
+                next_port=$((base_port + slot_num))
+
+                # Find all .env* files: root, apps/, and dirs with docker-compose
+                env_files=""
+                # Root level
+                for f in $(find "$fullpath" -maxdepth 1 -name ".env*" -type f 2>/dev/null); do
+                    env_files="$env_files $f"
+                done
+                # apps/*
+                for f in $(find "$fullpath/apps" -maxdepth 2 -name ".env*" -type f 2>/dev/null); do
+                    env_files="$env_files $f"
+                done
+                # directories with docker-compose
+                for compose in $(find "$fullpath" -name "docker-compose.yml" -o -name "docker-compose.yaml" 2>/dev/null); do
+                    compose_dir=$(dirname "$compose")
+                    for f in $(find "$compose_dir" -maxdepth 1 -name ".env*" -type f 2>/dev/null); do
+                        # Avoid duplicates
+                        echo "$env_files" | grep -q "$f" || env_files="$env_files $f"
+                    done
+                done
+
+                for env_file in $env_files; do
+                    [ ! -f "$env_file" ] && continue
+
+                    # Replace port values in existing env files
+                    sed -i '' "s/^PORT=.*/PORT=$next_port/" "$env_file" 2>/dev/null || true
+                    sed -i '' "s/^POSTGRES_PORT=.*/POSTGRES_PORT=$pg_port/" "$env_file" 2>/dev/null || true
+                    sed -i '' "s/^O11Y_POSTGRES_PORT=.*/O11Y_POSTGRES_PORT=$pg_o11y_port/" "$env_file" 2>/dev/null || true
+                    sed -i '' "s/^REDIS_PORT=.*/REDIS_PORT=$redis_port/" "$env_file" 2>/dev/null || true
+                    sed -i '' "s/^MINIO_PORT=.*/MINIO_PORT=$minio_port/" "$env_file" 2>/dev/null || true
+                    sed -i '' "s/^MINIO_WEB_PORT=.*/MINIO_WEB_PORT=$minio_web_port/" "$env_file" 2>/dev/null || true
+                    sed -i '' "s|^MINIO_ENDPOINT=.*|MINIO_ENDPOINT=http://localhost:$minio_port|" "$env_file" 2>/dev/null || true
+                    sed -i '' "s/^COMPOSE_PROJECT_NAME=.*/COMPOSE_PROJECT_NAME=$docker_name/" "$env_file" 2>/dev/null || true
+                    sed -i '' "s|localhost:5432|localhost:$pg_port|g" "$env_file" 2>/dev/null || true
+                    sed -i '' "s|localhost:5433|localhost:$pg_port|g" "$env_file" 2>/dev/null || true
+                    sed -i '' "s|localhost:6379|localhost:$redis_port|g" "$env_file" 2>/dev/null || true
+                    sed -i '' "s|localhost:3000|localhost:$next_port|g" "$env_file" 2>/dev/null || true
+
+                    rel_path=$(echo "$env_file" | sed "s|$fullpath/||")
+                    echo "  Updated: $rel_path"
+                done
+
+                echo "✓ Updated .env files (port: $next_port, pg: $pg_port)"
+            fi
+
+            # Install dependencies
+            echo "Installing dependencies..."
+            cd "$fullpath"
+            for lockfile in $(find . -name "pnpm-lock.yaml" -not -path "*/node_modules/*" 2>/dev/null); do
+                dir=$(dirname "$lockfile")
+                echo "  Installing in $dir..."
+                (cd "$dir" && pnpm install --frozen-lockfile 2>/dev/null) || true
+            done
+
+            # Start docker and clone database if docker-compose exists
+            if [ -n "$has_docker" ]; then
+                echo ""
+                echo "Starting docker and cloning database..."
+
+                for compose_file in $(find "$fullpath" -name "docker-compose.yml" -o -name "docker-compose.yaml" 2>/dev/null); do
+                    compose_dir=$(dirname "$compose_file")
+                    main_compose_dir=$(echo "$compose_dir" | sed "s|$fullpath|$main_repo|")
+
+                    # Get env file in that directory
+                    slot_env=$(find "$compose_dir" -maxdepth 1 -name ".env.local" -o -name ".env" 2>/dev/null | head -1)
+                    main_env=$(find "$main_compose_dir" -maxdepth 1 -name ".env.local" -o -name ".env" 2>/dev/null | head -1)
+
+                    if [ -z "$slot_env" ]; then
+                        echo "  Skipping $(basename "$compose_dir"): no .env file"
+                        continue
+                    fi
+
+                    # Read ports
+                    slot_pg=$(grep "^POSTGRES_PORT=" "$slot_env" 2>/dev/null | cut -d= -f2)
+                    main_pg=$(grep "^POSTGRES_PORT=" "$main_env" 2>/dev/null | cut -d= -f2)
+                    [ -z "$main_pg" ] && main_pg=5433  # default
+
+                    if [ -z "$slot_pg" ]; then
+                        echo "  Skipping $(basename "$compose_dir"): no POSTGRES_PORT"
+                        continue
+                    fi
+
+                    # Read credentials from docker-compose or use defaults
+                    pg_user=$(grep "POSTGRES_USER:" "$compose_file" | head -1 | sed 's/.*: *//' | tr -d '"' | tr -d "'" || echo "postgres")
+                    pg_pass=$(grep "POSTGRES_PASSWORD:" "$compose_file" | head -1 | sed 's/.*: *//' | tr -d '"' | tr -d "'" || echo "postgres")
+                    pg_db=$(grep "POSTGRES_DB:" "$compose_file" | head -1 | sed 's/.*: *//' | tr -d '"' | tr -d "'" || echo "postgres")
+
+                    echo "  Starting docker in $(basename "$compose_dir")..."
+                    (cd "$compose_dir" && docker compose --env-file .env.local up -d 2>/dev/null) || \
+                    (cd "$compose_dir" && docker compose --env-file .env up -d 2>/dev/null) || true
+
+                    # Wait for postgres to be ready
+                    echo "  Waiting for postgres on port $slot_pg..."
+                    for i in {1..30}; do
+                        if PGPASSWORD="$pg_pass" psql -h localhost -p "$slot_pg" -U "$pg_user" -c "SELECT 1" "$pg_db" >/dev/null 2>&1; then
+                            break
+                        fi
+                        sleep 1
+                    done
+
+                    # Check if main DB is running
+                    if PGPASSWORD="$pg_pass" psql -h localhost -p "$main_pg" -U "$pg_user" -c "SELECT 1" "$pg_db" >/dev/null 2>&1; then
+                        echo "  Cloning database from port $main_pg to $slot_pg..."
+                        PGPASSWORD="$pg_pass" pg_dump -h localhost -p "$main_pg" -U "$pg_user" "$pg_db" 2>/dev/null | \
+                        PGPASSWORD="$pg_pass" psql -h localhost -p "$slot_pg" -U "$pg_user" "$pg_db" >/dev/null 2>&1
+                        echo "  ✓ Database cloned"
+                    else
+                        echo "  ⚠ Main DB not running on port $main_pg, skipping clone"
+                        echo "    Run main DB first, then: jg slot docker clone"
+                    fi
+                done
+            fi
+
+            # Update registry
+            tmp=$(mktemp)
+            jq --arg name "$slot_name" --arg proj "$project" --argjson num "$slot_num" --arg branch "$branch_name" --argjson mirror "$mirror_mode" \
+               '.slots[$name] = {project: $proj, number: $num, branch: $branch, mirror: $mirror, created_at: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))}' \
+               "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+
+            echo ""
+            echo "════════════════════════════════════════"
+            if [ "$mirror_mode" = true ]; then
+                echo "✓ Mirror slot $slot_num ready"
+                echo ""
+                echo "  Path: $fullpath"
+                echo "  Mode: MIRROR (shares .env with main)"
+                echo ""
+                echo "  ⚠ Same database, same ports as main"
+            else
+                echo "✓ Slot $slot_num ready"
+                echo ""
+                echo "  Path: $fullpath"
+                echo "  Port: $next_port"
+            fi
+            echo ""
+            echo "cd $fullpath" | pbcopy
+            echo "→ Cmd+T, Cmd+V, Enter"
+            echo "→ Then: jg slot start"
+            ;;
+
+        "delete"|"rm"|"kill")
+            slot_num="$arg2"
+            if [ -z "$slot_num" ]; then
+                echo "Error: need slot number"
+                echo "Usage: jg slot delete <number>"
+                exit 1
+            fi
+
+            slot_name="${project}-${slot_num}"
+            fullpath=$(cd .. && pwd)/${slot_name}
+
+            if [ ! -d "$fullpath" ]; then
+                echo "Error: Slot $slot_name not found"
+                exit 1
+            fi
+
+            # Check for uncommitted changes
+            changes=$(git -C "$fullpath" status --porcelain 2>/dev/null)
+            if [ -n "$changes" ]; then
+                echo "Warning: Slot has uncommitted changes"
+                read -p "Delete anyway? [y/N] " confirm
+                [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 1
+            fi
+
+            # Stop docker if running
+            if [ -f "$fullpath/docker-compose.yml" ] || [ -f "$fullpath/docker-compose.yaml" ]; then
+                (cd "$fullpath" && docker compose --env-file .env --env-file .env.local down -v 2>/dev/null) || true
+            fi
+
+            # Remove worktree
+            branch_name=$(git -C "$fullpath" branch --show-current)
+            git worktree remove "$fullpath" --force
+            git branch -D "$branch_name" 2>/dev/null || true
+
+            # Update registry
+            tmp=$(mktemp)
+            jq --arg name "$slot_name" 'del(.slots[$name])' "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+
+            echo "✓ Deleted slot $slot_num"
+            ;;
+
+        "start")
+            claude --dangerously-skip-permissions
+            ;;
+
+        "continue")
+            claude --continue --dangerously-skip-permissions
+            ;;
+
+        "check"|"validate")
+            slot_num="$arg2"
+            if [ -z "$slot_num" ]; then
+                # Try to detect from current directory
+                slot_num=$(basename $(pwd) | grep -oE '[0-9]+$')
+            fi
+
+            if [ -z "$slot_num" ]; then
+                echo "Error: need slot number or run from slot directory"
+                exit 1
+            fi
+
+            slot_name="${project}-${slot_num}"
+            slot_path=$(cd .. && pwd)/${slot_name}
+
+            # Get project base port (or default to 3000)
+            base_port=$(get_base_port "$project")
+            [ -z "$base_port" ] && base_port=3000
+            project_offset=$(( (base_port - 3000) / 10 ))
+
+            echo "═══════════════════════════════════════"
+            echo "  SLOT VALIDATION: $slot_name"
+            echo "  Base port: $base_port"
+            echo "═══════════════════════════════════════"
+            echo ""
+
+            errors=0
+
+            # 1. Directory exists
+            if [ -d "$slot_path" ]; then
+                echo "✓ Directory exists"
+            else
+                echo "✗ Directory missing: $slot_path"
+                errors=$((errors + 1))
+            fi
+
+            # 2. Is git worktree
+            if [ -f "$slot_path/.git" ]; then
+                echo "✓ Is git worktree"
+            else
+                echo "✗ Not a git worktree"
+                errors=$((errors + 1))
+            fi
+
+            # 3. Branch
+            branch=$(git -C "$slot_path" branch --show-current 2>/dev/null)
+            if [ -n "$branch" ]; then
+                echo "✓ Branch: $branch"
+            else
+                echo "✗ Could not detect branch"
+                errors=$((errors + 1))
+            fi
+
+            # 4. Registry entry
+            if jq -e ".slots[\"$slot_name\"]" "$REGISTRY" >/dev/null 2>&1; then
+                echo "✓ Registry entry exists"
+            else
+                echo "✗ Missing from registry"
+                errors=$((errors + 1))
+            fi
+
+            # 5. Env files (if docker project)
+            if [ -f "$slot_path/docker-compose.yml" ] || [ -f "$slot_path/docker-compose.yaml" ]; then
+                expected_port=$((base_port + slot_num))
+                expected_pg=$((5432 + project_offset + slot_num))
+                env_checked=0
+                env_errors=0
+
+                for env_file in $(find "$slot_path" -maxdepth 1 -name ".env*" -type f 2>/dev/null); do
+                    env_checked=$((env_checked + 1))
+                    fname=$(basename "$env_file")
+
+                    # Check PORT
+                    port=$(grep "^PORT=" "$env_file" 2>/dev/null | cut -d= -f2)
+                    if [ -n "$port" ] && [ "$port" != "$expected_port" ]; then
+                        echo "✗ $fname: PORT=$port (expected $expected_port)"
+                        env_errors=$((env_errors + 1))
+                    fi
+
+                    # Check POSTGRES_PORT or DATABASE_URL
+                    pg=$(grep "^POSTGRES_PORT=" "$env_file" 2>/dev/null | cut -d= -f2)
+                    db_url=$(grep "DATABASE_URL" "$env_file" 2>/dev/null)
+
+                    if [ -n "$pg" ] && [ "$pg" != "$expected_pg" ]; then
+                        echo "✗ $fname: POSTGRES_PORT=$pg (expected $expected_pg)"
+                        env_errors=$((env_errors + 1))
+                    elif [ -n "$db_url" ] && echo "$db_url" | grep -q "localhost:5432"; then
+                        echo "✗ $fname: DATABASE_URL has default port 5432 (expected $expected_pg)"
+                        env_errors=$((env_errors + 1))
+                    fi
+                done
+
+                if [ "$env_checked" -eq 0 ]; then
+                    echo "✗ No .env* files found (docker project)"
+                    errors=$((errors + 1))
+                elif [ "$env_errors" -eq 0 ]; then
+                    echo "✓ All .env files have correct ports ($env_checked files)"
+                else
+                    errors=$((errors + env_errors))
+                fi
+
+                # Check for port conflicts with other slots
+                for other_slot in $(ls -d "${slot_path%/*}/${project}-"[0-9]* 2>/dev/null); do
+                    other_num=$(basename "$other_slot" | grep -oE '[0-9]+$')
+                    [ "$other_num" = "$slot_num" ] && continue
+
+                    other_port=$((base_port + other_num))
+                    if [ "$other_port" = "$expected_port" ]; then
+                        echo "✗ Port conflict with slot $other_num"
+                        errors=$((errors + 1))
+                    fi
+                done
+            else
+                echo "○ No docker-compose (skipping env check)"
+            fi
+
+            # 6. Node modules
+            missing_nm=0
+            total_nm=0
+            for lock in $(find "$slot_path" -name "pnpm-lock.yaml" -not -path "*/node_modules/*" 2>/dev/null); do
+                total_nm=$((total_nm + 1))
+                dir=$(dirname "$lock")
+                [ ! -d "$dir/node_modules" ] && missing_nm=$((missing_nm + 1))
+            done
+
+            if [ "$total_nm" -gt 0 ]; then
+                if [ "$missing_nm" -eq 0 ]; then
+                    echo "✓ All node_modules installed ($total_nm locations)"
+                else
+                    echo "✗ $missing_nm/$total_nm node_modules missing"
+                    errors=$((errors + 1))
+                fi
+            else
+                echo "○ No pnpm-lock.yaml found (skipping)"
+            fi
+
+            # 7. Apps env (if monorepo) - check for wrong ports in app env files
+            if [ -d "$slot_path/apps" ]; then
+                app_env_issues=0
+                expected_port=$((base_port + slot_num))
+
+                for env_file in $(find "$slot_path/apps" -maxdepth 2 -name ".env*" -type f 2>/dev/null); do
+                    port=$(grep "^PORT=" "$env_file" 2>/dev/null | cut -d= -f2)
+                    if [ -n "$port" ] && [ "$port" != "$expected_port" ]; then
+                        echo "✗ $(echo "$env_file" | sed "s|$slot_path/||"): PORT=$port"
+                        app_env_issues=$((app_env_issues + 1))
+                    fi
+                done
+
+                if [ "$app_env_issues" -eq 0 ]; then
+                    echo "✓ Apps env files have correct ports"
+                else
+                    errors=$((errors + app_env_issues))
+                fi
+            fi
+
+            echo ""
+            echo "═══════════════════════════════════════"
+            if [ "$errors" -eq 0 ]; then
+                echo "  ✓ ALL CHECKS PASSED"
+            else
+                echo "  ✗ $errors ISSUES FOUND"
+            fi
+            echo "═══════════════════════════════════════"
+            ;;
+
+        "docker")
+            subcmd="$arg2"
+            case "$subcmd" in
+                "up")
+                    docker compose --env-file .env --env-file .env.local up -d
+                    grep "_PORT=\|_URL=" .env.local 2>/dev/null | grep -v "^#"
+                    ;;
+                "down")
+                    docker compose --env-file .env --env-file .env.local down
+                    ;;
+                "clone")
+                    wt_pg_port=$(grep "^POSTGRES_PORT=" .env.local | cut -d= -f2)
+                    echo "Cloning DB from main (5432) to slot ($wt_pg_port)..."
+                    PGPASSWORD=postgres pg_dump -h localhost -p 5432 -U postgres postgres 2>/dev/null | \
+                    PGPASSWORD=postgres psql -h localhost -p "$wt_pg_port" -U postgres postgres >/dev/null 2>&1
+                    echo "✓ Done"
+                    ;;
+                *)
+                    echo "Usage: jg slot docker [up|down|clone]"
+                    ;;
+            esac
+            ;;
+
+        *)
+            echo "slot commands:"
+            echo "  list              Show running Claude instances"
+            echo "  new [N]           Create slot (auto-increment if no number)"
+            echo "  delete <N>        Delete slot"
+            echo "  start             Start Claude"
+            echo "  continue          Continue Claude session"
+            echo "  docker up|down    Manage docker for slot"
+            ;;
+    esac
+
+clean *args:
+    #!/bin/bash
+    set -e
+
+    full_args="{{args}}"
+    do_clean=$(echo "$full_args" | grep -q "\-\-do" && echo "yes" || echo "no")
+    force=$(echo "$full_args" | grep -q "\-\-force" && echo "yes" || echo "no")
+
+    # Colors
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    CYAN='\033[0;36m'
+    NC='\033[0m' # No Color
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "                        JG CLEAN"
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+
+    # Track what we find
+    safe_tmux=""
+    safe_worktrees=""
+    blocked_items=""
+    warnings=""
+
+    # 1. Check tmux sessions
+    echo -e "${CYAN}Scanning tmux sessions...${NC}"
+    for session in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
+        # Check if Claude is running in this session
+        has_claude=$(tmux list-panes -t "$session" -F "#{pane_current_command}" 2>/dev/null | grep -i claude || true)
+        if [ -n "$has_claude" ]; then
+            blocked_items="$blocked_items\n  ${RED}✗${NC} tmux:$session - Claude running"
+        else
+            safe_tmux="$safe_tmux $session"
+            echo -e "  ${GREEN}✓${NC} tmux:$session - safe to kill"
+        fi
+    done
+    [ -z "$(tmux list-sessions 2>/dev/null)" ] && echo "  (no tmux sessions)"
+
+    echo ""
+
+    # 2. Check git worktrees
+    echo -e "${CYAN}Scanning worktrees...${NC}"
+
+    # Find all worktrees in parent directory
+    current_dir=$(pwd)
+    parent_dir=$(dirname "$current_dir")
+
+    for wt in $(find "$parent_dir" -maxdepth 1 -type d -name "*-ws-*" -o -name "*-[0-9]*" 2>/dev/null | grep -v "^$current_dir$"); do
+        [ ! -d "$wt/.git" ] && [ ! -f "$wt/.git" ] && continue
+
+        wt_name=$(basename "$wt")
+        branch=$(git -C "$wt" branch --show-current 2>/dev/null || echo "unknown")
+
+        # Check 1: Uncommitted changes
+        uncommitted=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+        # Check 2: Unpushed commits
+        unpushed=$(git -C "$wt" log "origin/$branch..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+
+        # Check 3: Unmerged with main
+        # Try origin/main first, then origin/master
+        unmerged=$(git -C "$wt" log "origin/main..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ' || \
+                   git -C "$wt" log "origin/master..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+
+        status_line=""
+        is_blocked="no"
+        is_warning="no"
+
+        if [ "$uncommitted" -gt 0 ]; then
+            status_line="${RED}DIRTY${NC}: $uncommitted uncommitted files"
+            is_blocked="yes"
+        elif [ "$unpushed" -gt 0 ]; then
+            status_line="${RED}UNPUSHED${NC}: $unpushed commits not on remote"
+            is_blocked="yes"
+        elif [ "$unmerged" -gt 0 ]; then
+            status_line="${YELLOW}UNMERGED${NC}: $unmerged commits not in main"
+            is_warning="yes"
+        else
+            status_line="${GREEN}CLEAN${NC}: merged to main, no local changes"
+        fi
+
+        if [ "$is_blocked" = "yes" ]; then
+            blocked_items="$blocked_items\n  ${RED}✗${NC} $wt_name ($branch) - $status_line"
+        elif [ "$is_warning" = "yes" ]; then
+            warnings="$warnings\n  ${YELLOW}⚠${NC} $wt_name ($branch) - $status_line"
+            # Still add to safe if --force
+            if [ "$force" = "yes" ]; then
+                safe_worktrees="$safe_worktrees $wt"
+            fi
+        else
+            safe_worktrees="$safe_worktrees $wt"
+            echo -e "  ${GREEN}✓${NC} $wt_name ($branch) - $status_line"
+        fi
+    done
+
+    [ -z "$safe_worktrees" ] && [ -z "$blocked_items" ] && [ -z "$warnings" ] && echo "  (no worktrees found)"
+
+    echo ""
+
+    # 3. Summary
+    echo "════════════════════════════════════════════════════════════════"
+
+    if [ -n "$blocked_items" ]; then
+        echo -e "${RED}BLOCKED - cannot clean:${NC}"
+        echo -e "$blocked_items"
+        echo ""
+    fi
+
+    if [ -n "$warnings" ]; then
+        echo -e "${YELLOW}WARNINGS - unmerged branches:${NC}"
+        echo -e "$warnings"
+        echo -e "  (use --force to include these)"
+        echo ""
+    fi
+
+    safe_count=0
+    [ -n "$safe_tmux" ] && safe_count=$((safe_count + $(echo $safe_tmux | wc -w)))
+    [ -n "$safe_worktrees" ] && safe_count=$((safe_count + $(echo $safe_worktrees | wc -w)))
+
+    if [ "$safe_count" -eq 0 ]; then
+        echo -e "${CYAN}Nothing safe to clean.${NC}"
+        exit 0
+    fi
+
+    echo -e "${GREEN}SAFE TO CLEAN: $safe_count items${NC}"
+
+    if [ "$do_clean" != "yes" ]; then
+        echo ""
+        echo "This is a dry run. To actually clean, run:"
+        echo "  jg clean --do"
+        if [ -n "$warnings" ]; then
+            echo "  jg clean --do --force  (include unmerged branches)"
+        fi
+        exit 0
+    fi
+
+    # Actually clean
+    echo ""
+    echo -e "${CYAN}Cleaning...${NC}"
+
+    # Kill tmux sessions
+    for session in $safe_tmux; do
+        tmux kill-session -t "$session" 2>/dev/null && echo -e "  ${GREEN}✓${NC} Killed tmux:$session"
+    done
+
+    # Remove worktrees
+    for wt in $safe_worktrees; do
+        wt_name=$(basename "$wt")
+        branch=$(git -C "$wt" branch --show-current 2>/dev/null)
+
+        # Stop docker if running
+        if [ -f "$wt/docker-compose.yml" ] || [ -f "$wt/docker-compose.yaml" ]; then
+            (cd "$wt" && docker compose down -v 2>/dev/null) || true
+        fi
+
+        # Find main repo
+        if [ -f "$wt/.git" ]; then
+            main_repo=$(cat "$wt/.git" | sed 's/gitdir: //' | sed 's/\/.git\/worktrees.*//')
+        else
+            continue
+        fi
+
+        # Remove worktree and branch
+        git -C "$main_repo" worktree remove "$wt" --force 2>/dev/null && \
+        git -C "$main_repo" branch -D "$branch" 2>/dev/null && \
+        echo -e "  ${GREEN}✓${NC} Removed worktree: $wt_name"
+    done
+
+    echo ""
+    echo -e "${GREEN}Done!${NC}"
