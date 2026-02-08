@@ -8,9 +8,11 @@ import path from "path";
 const execAsync = promisify(exec);
 
 interface SlotRegistry {
-  projects: Record<string, { base_port: number; path: string }>;
-  slots: Record<string, { project: string; number: number; branch: string; created_at: string }>;
+  groups?: Record<string, { name: string; order: number }>;
+  projects: Record<string, { base_port: number; path: string; group?: string }>;
+  slots: Record<string, { project: string; number: number; branch: string; created_at: string; tags?: string[] }>;
   workspaces?: Record<string, { name: string; description: string; paths: string[]; created_at: string }>;
+  tags?: Record<string, { name: string; color: string }>;
 }
 
 interface DockerContainer {
@@ -51,6 +53,7 @@ interface Slot {
   };
   docker: DockerContainer | null;
   claude: ClaudeInstance | null;
+  tags: string[];
 }
 
 interface ProjectGroup {
@@ -58,6 +61,13 @@ interface ProjectGroup {
   basePath: string;
   basePort: number;
   slots: Slot[];
+}
+
+interface Group {
+  id: string;
+  name: string;
+  order: number;
+  projects: ProjectGroup[];
 }
 
 interface WorkspaceMember {
@@ -284,6 +294,7 @@ export async function GET() {
       claude: claudes.find((c) =>
         slotPath && (c.cwd === slotPath || c.cwd.startsWith(slotPath + "/"))
       ) || null,
+      tags: slot.tags || [],
     };
   });
 
@@ -307,6 +318,35 @@ export async function GET() {
       basePath: "",
       basePort: 3000,
       slots: orphanSlots,
+    });
+  }
+
+  // Build hierarchical groups
+  const registryGroups = registry.groups || {};
+  const groups: Group[] = Object.entries(registryGroups)
+    .map(([id, group]) => {
+      const groupProjects = projectGroups.filter(
+        (pg) => registry.projects[pg.name]?.group === id
+      );
+      return {
+        id,
+        name: group.name,
+        order: group.order,
+        projects: groupProjects,
+      };
+    })
+    .sort((a, b) => a.order - b.order);
+
+  // Add ungrouped projects to "Other" group
+  const ungroupedProjects = projectGroups.filter(
+    (pg) => !registry.projects[pg.name]?.group
+  );
+  if (ungroupedProjects.length > 0) {
+    groups.push({
+      id: "other",
+      name: "Other",
+      order: 999,
+      projects: ungroupedProjects,
     });
   }
 
@@ -376,13 +416,16 @@ export async function GET() {
   );
 
   return NextResponse.json({
-    projects: projectGroups,
+    groups,
+    projects: projectGroups, // kept for backward compatibility
     workspaces,
     unregisteredClaudes,
     orphanContainers,
+    tags: registry.tags || {},
     summary: {
       totalSlots: slots.length,
       totalWorkspaces: workspaces.length,
+      totalGroups: groups.length,
       runningClaudes: claudes.length,
       runningContainers: containers.length,
       orphanClaudes: unregisteredClaudes.length,

@@ -42,6 +42,7 @@ interface Slot {
   };
   docker: DockerContainer | null;
   claude: ClaudeInstance | null;
+  tags: string[];
 }
 
 interface ProjectGroup {
@@ -49,6 +50,13 @@ interface ProjectGroup {
   basePath: string;
   basePort: number;
   slots: Slot[];
+}
+
+interface Group {
+  id: string;
+  name: string;
+  order: number;
+  projects: ProjectGroup[];
 }
 
 interface WorkspaceMember {
@@ -67,13 +75,16 @@ interface Workspace {
 }
 
 interface APIResponse {
+  groups: Group[];
   projects: ProjectGroup[];
   workspaces: Workspace[];
   unregisteredClaudes: ClaudeInstance[];
   orphanContainers: DockerContainer[];
+  tags: Record<string, { name: string; color: string }>;
   summary: {
     totalSlots: number;
     totalWorkspaces: number;
+    totalGroups: number;
     runningClaudes: number;
     runningContainers: number;
     orphanClaudes: number;
@@ -111,6 +122,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 function SlotCard({ slot }: { slot: Slot }) {
   const isActive = slot.claude !== null;
   const hasDocker = slot.docker !== null;
+  const hasTags = slot.tags && slot.tags.length > 0;
 
   // Build chat URL with project path and tmux session (convention: slot name)
   const chatUrl = `/chat?project=${encodeURIComponent(slot.path)}&tmux=${encodeURIComponent(slot.name)}`;
@@ -125,6 +137,15 @@ function SlotCard({ slot }: { slot: Slot }) {
           </div>
           <Badge variant="outline" className="text-xs font-normal shrink-0">#{slot.number}</Badge>
         </div>
+        {hasTags && (
+          <div className="flex flex-wrap gap-1 mt-2">
+            {slot.tags.map((tag) => (
+              <Badge key={tag} variant="secondary" className="text-xs bg-violet-500/10 text-violet-400 border-violet-500/30">
+                {tag}
+              </Badge>
+            ))}
+          </div>
+        )}
       </CardHeader>
       <CardContent className="px-4 pb-0 space-y-0">
         <Row label="branch"><span className="text-sky-400">{slot.branch}</span></Row>
@@ -389,19 +410,20 @@ function Section({ title, count, color, children }: {
   );
 }
 
-function ProjectSection({ project }: { project: ProjectGroup }) {
+function ProjectSection({ project, nested }: { project: ProjectGroup; nested?: boolean }) {
   const activeSlots = project.slots.filter((s) => s.claude !== null);
 
   return (
-    <Section title={project.name}>
-      <div className="flex items-center gap-3 mb-4 text-sm text-muted-foreground">
-        <span className="font-mono">{project.basePath}</span>
-        <span>•</span>
-        <span>port <span className="text-foreground font-mono">{project.basePort}</span></span>
-        <span>•</span>
-        <span className="text-emerald-500">{activeSlots.length}</span>
-        <span>/</span>
-        <span>{project.slots.length} slots</span>
+    <div className={nested ? "mb-6" : "mb-8"}>
+      <div className="flex items-center gap-3 mb-3">
+        <h3 className={`font-medium ${nested ? "text-base" : "text-lg"}`}>{project.name}</h3>
+        <span className="text-sm text-muted-foreground font-mono">{project.basePath.split("/").slice(-2).join("/")}</span>
+        <span className="text-sm text-muted-foreground">•</span>
+        <span className="text-sm">port <span className="text-foreground font-mono">{project.basePort}</span></span>
+        <span className="text-sm text-muted-foreground">•</span>
+        <span className="text-sm text-emerald-500">{activeSlots.length}</span>
+        <span className="text-sm text-muted-foreground">/</span>
+        <span className="text-sm text-muted-foreground">{project.slots.length} slots</span>
       </div>
 
       {project.slots.length === 0 ? (
@@ -413,7 +435,37 @@ function ProjectSection({ project }: { project: ProjectGroup }) {
           ))}
         </div>
       )}
-    </Section>
+    </div>
+  );
+}
+
+function GroupSection({ group }: { group: Group }) {
+  const totalSlots = group.projects.reduce((sum, p) => sum + p.slots.length, 0);
+  const activeSlots = group.projects.reduce(
+    (sum, p) => sum + p.slots.filter((s) => s.claude !== null).length,
+    0
+  );
+
+  return (
+    <section className="mb-10">
+      <div className="flex items-center gap-3 mb-4 pb-2 border-b">
+        <h2 className="text-xl font-semibold text-violet-400">{group.name}</h2>
+        <span className="text-sm text-muted-foreground">
+          {group.projects.length} project{group.projects.length !== 1 ? "s" : ""}
+        </span>
+        <span className="text-sm text-muted-foreground">•</span>
+        <span className="text-sm">
+          <span className="text-emerald-500">{activeSlots}</span>
+          <span className="text-muted-foreground">/{totalSlots} active</span>
+        </span>
+      </div>
+
+      <div className="pl-4 border-l-2 border-violet-500/20">
+        {group.projects.map((project) => (
+          <ProjectSection key={project.name} project={project} nested />
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -544,12 +596,12 @@ export default function Home() {
         <h1 className="text-2xl font-semibold mb-4">Workflow</h1>
         <div className="flex flex-wrap gap-6 text-sm">
           <div className="flex items-baseline gap-2">
-            <span className="text-muted-foreground">Slots</span>
-            <span className="font-mono">{data?.summary.totalSlots}</span>
+            <span className="text-muted-foreground">Groups</span>
+            <span className="font-mono">{data?.summary.totalGroups}</span>
           </div>
           <div className="flex items-baseline gap-2">
-            <span className="text-muted-foreground">Workspaces</span>
-            <span className="font-mono">{data?.summary.totalWorkspaces}</span>
+            <span className="text-muted-foreground">Slots</span>
+            <span className="font-mono">{data?.summary.totalSlots}</span>
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-muted-foreground">Claude</span>
@@ -577,9 +629,9 @@ export default function Home() {
         </>
       )}
 
-      {/* Projects with slots */}
-      {data?.projects.map((project) => (
-        <ProjectSection key={project.name} project={project} />
+      {/* Groups with nested projects and slots */}
+      {data?.groups?.map((group) => (
+        <GroupSection key={group.id} group={group} />
       ))}
 
       {data?.unregisteredClaudes && data.unregisteredClaudes.length > 0 && (
