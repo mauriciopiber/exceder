@@ -135,7 +135,11 @@ function SlotCard({ slot }: { slot: Slot }) {
             <span className={`w-2 h-2 rounded-full shrink-0 ${isActive ? "bg-emerald-500" : "bg-muted"}`} />
             <CardTitle className="text-base font-mono truncate">{slot.name}</CardTitle>
           </div>
-          <Badge variant="outline" className="text-xs font-normal shrink-0">#{slot.number}</Badge>
+          {slot.number === 0 ? (
+            <Badge variant="outline" className="text-xs font-normal shrink-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">main</Badge>
+          ) : (
+            <Badge variant="outline" className="text-xs font-normal shrink-0">#{slot.number}</Badge>
+          )}
         </div>
         {hasTags && (
           <div className="flex flex-wrap gap-1 mt-2">

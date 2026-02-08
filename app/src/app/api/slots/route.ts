@@ -298,14 +298,40 @@ export async function GET() {
     };
   });
 
-  // Group by project
+  // Create "main" slot for each registered project (the parent worktree)
+  const mainSlots: Slot[] = Object.entries(registry.projects).map(([name, project]) => {
+    const mainPath = project.path;
+    return {
+      name: name,
+      project: name,
+      number: 0, // main is always slot 0
+      branch: "main",
+      path: mainPath,
+      createdAt: "",
+      ports: {
+        web: project.base_port,
+        postgres: 5432 + Math.floor((project.base_port - 3000) / 10),
+      },
+      docker: containers.find((c) => c.name === `${name}-db`) || null,
+      claude: claudes.find((c) =>
+        mainPath && (c.cwd === mainPath || c.cwd.startsWith(mainPath + "/"))
+      ) || null,
+      tags: [],
+    };
+  });
+
+  // Group by project (main + numbered slots)
   const projectGroups: ProjectGroup[] = Object.entries(registry.projects).map(
-    ([name, project]) => ({
-      name,
-      basePath: project.path,
-      basePort: project.base_port,
-      slots: slots.filter((s) => s.project === name),
-    })
+    ([name, project]) => {
+      const mainSlot = mainSlots.find((s) => s.project === name);
+      const numberedSlots = slots.filter((s) => s.project === name);
+      return {
+        name,
+        basePath: project.path,
+        basePort: project.base_port,
+        slots: mainSlot ? [mainSlot, ...numberedSlots] : numberedSlots,
+      };
+    }
   );
 
   // Add orphan slots (project not registered)
@@ -392,9 +418,10 @@ export async function GET() {
     .flatMap((ws) => ws.members)
     .flatMap((m) => m.claudes.map((c) => c.cwd));
 
-  // Find unregistered claude instances (not matched to any slot or workspace)
+  // Find unregistered claude instances (not matched to any slot, main, or workspace)
   const matchedClaudeCwds = [
     ...slots.filter((s) => s.claude !== null).map((s) => s.claude!.cwd),
+    ...mainSlots.filter((s) => s.claude !== null).map((s) => s.claude!.cwd),
     ...workspaceClaudeCwds,
   ];
   const unregisteredClaudes = claudes.filter(
