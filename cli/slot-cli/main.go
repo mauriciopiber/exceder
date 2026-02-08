@@ -56,6 +56,12 @@ func main() {
 		cmdContinue()
 	case "check":
 		cmdCheck(args)
+	case "sync":
+		cmdSync()
+	case "db-sync":
+		cmdDBSync()
+	case "merge":
+		cmdMerge(args)
 	default:
 		printUsage()
 	}
@@ -71,6 +77,9 @@ Commands:
   start             Start Claude in current directory
   continue          Continue Claude session
   check [N]         Validate slot configuration
+  sync              Rebase slot branch on main (pull latest changes)
+  db-sync           Clone database from main to current slot
+  merge <N>         Merge slot branch into main (run from main)
 
 Options:
   --force, -f       Force delete without confirmation`)
@@ -320,6 +329,244 @@ func cmdCheck(args []string) {
 	fmt.Println("═══════════════════════════════════════")
 }
 
+func cmdSync() {
+	cwd, _ := os.Getwd()
+	mainRepo, _ := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// Check if we're in a slot (worktree)
+	if mainRepo == cwd {
+		fmt.Println("Error: already in main worktree, nothing to sync")
+		os.Exit(1)
+	}
+
+	branch := getBranchName(cwd)
+	if branch == "" {
+		fmt.Println("Error: could not detect current branch")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Syncing slot branch '%s' with main...\n\n", branch)
+
+	// Check for uncommitted changes
+	out, _ := exec.Command("git", "-C", cwd, "status", "--porcelain").Output()
+	if len(out) > 0 {
+		fmt.Println("Error: uncommitted changes detected")
+		fmt.Println("Please commit or stash your changes before syncing")
+		os.Exit(1)
+	}
+
+	// Fetch latest from origin
+	fmt.Println("Fetching latest from origin...")
+	if err := runCmd(cwd, "git", "fetch", "origin", "main:main"); err != nil {
+		// Try without the ref update (origin/main might not exist locally)
+		runCmd(cwd, "git", "fetch", "origin", "main")
+	}
+	fmt.Println("✓ Fetched latest main")
+
+	// Check if rebase is needed
+	behindOut, _ := exec.Command("git", "-C", cwd, "rev-list", "--count", branch+"..main").Output()
+	behind := strings.TrimSpace(string(behindOut))
+
+	aheadOut, _ := exec.Command("git", "-C", cwd, "rev-list", "--count", "main.."+branch).Output()
+	ahead := strings.TrimSpace(string(aheadOut))
+
+	fmt.Printf("\nStatus: %s commits ahead, %s commits behind main\n", ahead, behind)
+
+	if behind == "0" {
+		fmt.Println("\n✓ Already up to date with main")
+		return
+	}
+
+	// Perform rebase
+	fmt.Println("\nRebasing on main...")
+	cmd := exec.Command("git", "-C", cwd, "rebase", "main")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Println("\n⚠ Rebase conflict detected!")
+		fmt.Println("\nTo resolve:")
+		fmt.Println("  1. Fix conflicts in the affected files")
+		fmt.Println("  2. git add <fixed files>")
+		fmt.Println("  3. git rebase --continue")
+		fmt.Println("\nTo abort:")
+		fmt.Println("  git rebase --abort")
+		os.Exit(1)
+	}
+
+	fmt.Println("\n✓ Successfully synced with main")
+}
+
+func cmdMerge(args []string) {
+	slotNum := 0
+	for _, arg := range args {
+		if n, err := strconv.Atoi(arg); err == nil {
+			slotNum = n
+			break
+		}
+	}
+
+	if slotNum == 0 {
+		fmt.Println("Error: need slot number")
+		fmt.Println("Usage: slot-cli merge <N>")
+		os.Exit(1)
+	}
+
+	cwd, _ := os.Getwd()
+	mainRepo, _ := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// Must be run from main worktree
+	if mainRepo != cwd {
+		fmt.Println("Error: must run from main worktree, not from a slot")
+		os.Exit(1)
+	}
+
+	branchName := fmt.Sprintf("slot-%d", slotNum)
+
+	// Check branch exists
+	out, err := exec.Command("git", "-C", mainRepo, "branch", "--list", branchName).Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		fmt.Printf("Error: branch '%s' not found\n", branchName)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Merging %s into main...\n", branchName)
+
+	cmd := exec.Command("git", "-C", mainRepo, "merge", branchName)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Println("\n⚠ Merge conflict!")
+		fmt.Println("Resolve conflicts, then: git commit")
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n✓ Merged %s into main\n", branchName)
+}
+
+func cmdDBSync() {
+	cwd, _ := os.Getwd()
+	mainRepo, _ := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// Check if we're in a slot (worktree)
+	if mainRepo == cwd {
+		fmt.Println("Error: already in main worktree, nothing to sync")
+		os.Exit(1)
+	}
+
+	slotPath := cwd
+
+	fmt.Println("Syncing database from main worktree...\n")
+
+	// Find docker-compose files in slot
+	composeFiles := []string{}
+	filepath.Walk(slotPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if info.Name() == "docker-compose.yml" || info.Name() == "docker-compose.yaml" {
+			composeFiles = append(composeFiles, path)
+		}
+		return nil
+	})
+
+	if len(composeFiles) == 0 {
+		fmt.Println("Error: no docker-compose files found")
+		os.Exit(1)
+	}
+
+	synced := 0
+
+	for _, composeFile := range composeFiles {
+		composeDir := filepath.Dir(composeFile)
+		mainComposeDir := strings.Replace(composeDir, slotPath, mainRepo, 1)
+		relDir, _ := filepath.Rel(slotPath, composeDir)
+
+		fmt.Printf("─── %s ───\n", relDir)
+
+		// Read postgres config from compose file
+		pgUser, pgPass, pgDB := parseDockerCompose(composeFile)
+
+		// Find slot postgres port
+		slotPgPort := 0
+		for _, envName := range []string{".env.local", ".env"} {
+			envPath := filepath.Join(composeDir, envName)
+			if port := readEnvVar(envPath, "POSTGRES_PORT"); port > 0 {
+				slotPgPort = port
+				break
+			}
+		}
+
+		// Find main postgres port
+		mainPgPort := 0
+		for _, envName := range []string{".env.local", ".env"} {
+			envPath := filepath.Join(mainComposeDir, envName)
+			if port := readEnvVar(envPath, "POSTGRES_PORT"); port > 0 {
+				mainPgPort = port
+				break
+			}
+		}
+
+		if slotPgPort == 0 {
+			fmt.Println("  ⚠ No POSTGRES_PORT found in slot, skipping")
+			continue
+		}
+
+		if mainPgPort == 0 {
+			fmt.Println("  ⚠ No POSTGRES_PORT found in main, skipping")
+			continue
+		}
+
+		fmt.Printf("  Main DB: localhost:%d\n", mainPgPort)
+		fmt.Printf("  Slot DB: localhost:%d\n", slotPgPort)
+
+		// Check if main DB is running
+		if !isPostgresReady(mainPgPort, pgUser, pgPass, pgDB) {
+			fmt.Printf("  ⚠ Main DB not running on port %d, skipping\n", mainPgPort)
+			continue
+		}
+
+		// Check if slot DB is running, start if not
+		if !isPostgresReady(slotPgPort, pgUser, pgPass, pgDB) {
+			fmt.Println("  Starting slot DB...")
+			startDockerCompose(composeDir)
+			if !waitForPostgres(slotPgPort, pgUser, pgPass, pgDB, 30) {
+				fmt.Println("  ⚠ Could not start slot DB, skipping")
+				continue
+			}
+		}
+
+		// Clone database
+		fmt.Printf("  Cloning %s...\n", pgDB)
+		cloneDatabase(mainPgPort, slotPgPort, pgUser, pgPass, pgDB)
+		fmt.Println("  ✓ Database synced")
+		synced++
+	}
+
+	fmt.Println()
+	if synced > 0 {
+		fmt.Printf("✓ Synced %d database(s) from main\n", synced)
+	} else {
+		fmt.Println("⚠ No databases were synced")
+	}
+}
+
 // Helper functions
 
 func detectProject(cwd string) (mainRepo, project string) {
@@ -535,7 +782,12 @@ func updateSlotEnvFiles(slotPath string, portMap map[int]int, slotName string) {
 			}
 		}
 
-		if !strings.Contains(filepath.Base(path), ".env") {
+		baseName := filepath.Base(path)
+		if !strings.Contains(baseName, ".env") {
+			return nil
+		}
+		// Skip example files - they should remain as templates
+		if strings.Contains(baseName, ".example") {
 			return nil
 		}
 

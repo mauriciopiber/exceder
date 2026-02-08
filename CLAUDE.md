@@ -25,6 +25,8 @@ Powered by `slot-cli` (Go binary at `~/bin/slot-cli`).
 | `xc slot delete <N>` | main repo | Delete slot |
 | `xc slot list` | anywhere | Show running Claude instances |
 | `xc slot check` | slot dir | Validate slot config |
+| `xc slot sync` | slot dir | Rebase slot branch on main |
+| `xc slot db-sync` | slot dir | Clone database from main to slot |
 
 **Auto features:**
 - Scans `.env` files for ports, allocates slot-specific ports
