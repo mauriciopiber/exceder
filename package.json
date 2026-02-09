@@ -1,0 +1,14 @@
+{
+  "name": "exceder",
+  "private": true,
+  "scripts": {
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "cd app && npx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.13",
+    "lefthook": "^2.1.0"
+  }
+}

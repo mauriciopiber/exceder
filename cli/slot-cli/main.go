@@ -15,20 +15,30 @@ import (
 )
 
 type Registry struct {
+	Groups   map[string]GroupConfig   `json:"groups,omitempty"`
 	Projects map[string]ProjectConfig `json:"projects"`
 	Slots    map[string]SlotConfig    `json:"slots"`
+}
+
+type GroupConfig struct {
+	Name  string `json:"name"`
+	Order int    `json:"order"`
 }
 
 type ProjectConfig struct {
 	BasePort int    `json:"base_port"`
 	Path     string `json:"path"`
+	Group    string `json:"group,omitempty"`
 }
 
 type SlotConfig struct {
 	Project   string `json:"project"`
-	Number    int    `json:"number"`
+	Number    int    `json:"number"`    // 0 for named slots
+	Name      string `json:"name"`      // empty for numbered slots
 	Branch    string `json:"branch"`
 	CreatedAt string `json:"created_at"`
+	Locked    bool   `json:"locked,omitempty"`
+	LockNote  string `json:"lock_note,omitempty"`
 }
 
 var registryPath = filepath.Join(os.Getenv("HOME"), ".config", "slots", "registry.json")
@@ -53,6 +63,8 @@ func main() {
 		cmdStart()
 	case "continue":
 		cmdContinue()
+	case "init":
+		cmdInit(args)
 	case "check":
 		cmdCheck(args)
 	case "sync":
@@ -61,6 +73,28 @@ func main() {
 		cmdDBSync()
 	case "merge":
 		cmdMerge(args)
+	case "done":
+		cmdDone(args)
+	case "pr":
+		cmdPR(args)
+	case "lock":
+		cmdLock(args)
+	case "unlock":
+		cmdUnlock(args)
+	case "group":
+		cmdGroup(args)
+	case "clean":
+		if len(args) > 0 && args[0] == "claude" {
+			cmdCleanClaude(args[1:])
+		} else if len(args) > 0 && args[0] == "storybook" {
+			cmdCleanStorybook(args[1:])
+		} else if len(args) > 0 && args[0] == "web" {
+			cmdCleanWeb(args[1:])
+		} else if len(args) > 0 && args[0] == "docker" {
+			cmdCleanDocker(args[1:])
+		} else {
+			cmdClean(args)
+		}
 	case "verify":
 		cmdVerify()
 	case "fix-ports":
@@ -74,8 +108,10 @@ func printUsage() {
 	fmt.Println(`slot-cli - Smart slot management for parallel development
 
 Commands:
-  new [N]           Create slot (auto-increment if no number)
-  delete <N>        Delete slot (use --force to skip confirmation)
+  new [N|name]      Create slot (number or name, auto-increment if omitted)
+  delete <N|name>   Delete slot (use --force to skip confirmation)
+  done              Merge current slot into main + cleanup (run from slot)
+  pr                Push and create PR for current slot
   list              Show running Claude instances
   start             Start Claude in current directory
   continue          Continue Claude session
@@ -85,17 +121,365 @@ Commands:
   sync              Rebase slot branch on main (pull latest changes)
   db-sync           Clone database from main to current slot
   merge <N>         Merge slot branch into main (run from main)
+  lock [note]       Lock current slot (prevents deletion)
+  unlock            Unlock current slot
+  init [port]       Register current project (auto-detects port and group)
+  group list        Show all groups and their projects
+  group create      Create a group: group create <id> "<name>"
+  group assign      Assign project to group: group assign <project> <group-id>
+  clean             Scan for stale worktrees and tmux sessions
+  clean claude      List/stop Claude instances (--orphans, --all)
+  clean docker      List/stop docker containers (--orphans, --all)
+  clean storybook   List/kill storybook processes (--orphans, --all)
+  clean web         List/kill web servers (--orphans, --all)
 
 Options:
-  --force, -f       Force delete without confirmation`)
+  --force, -f       Force operations without confirmation
+  --do              Execute clean (default is dry run)`)
+}
+
+func cmdInit(args []string) {
+	cwd, _ := os.Getwd()
+	mainRepo, project := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// If running from a worktree, use the main repo
+	if mainRepo != cwd {
+		fmt.Printf("Note: detected main repo at %s\n", mainRepo)
+	}
+
+	// Detect base port from .env files
+	basePort := readEnvPort(mainRepo, "PORT")
+	if basePort == 0 {
+		basePort = 3000 // default
+	}
+
+	// Allow override via args
+	for _, arg := range args {
+		if n, err := strconv.Atoi(arg); err == nil {
+			basePort = n
+		}
+	}
+
+	reg := loadRegistry()
+
+	// Check if already registered
+	if existing, ok := reg.Projects[project]; ok {
+		fmt.Printf("Project '%s' already registered:\n", project)
+		fmt.Printf("  Path: %s\n", existing.Path)
+		fmt.Printf("  Port: %d\n", existing.BasePort)
+		fmt.Println("\nTo update, edit ~/.config/slots/registry.json")
+		return
+	}
+
+	// Auto-detect group from path (/Projects/<owner>/<project>)
+	groupID := ""
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--group=") {
+			groupID = strings.TrimPrefix(arg, "--group=")
+		}
+	}
+	if groupID == "" {
+		groupID = detectGroupFromPath(mainRepo)
+	}
+
+	// Ensure group exists
+	if groupID != "" {
+		if _, ok := reg.Groups[groupID]; !ok {
+			reg.Groups[groupID] = GroupConfig{
+				Name:  titleCase(groupID),
+				Order: len(reg.Groups) + 1,
+			}
+			fmt.Printf("Auto-created group: %s (%s)\n", titleCase(groupID), groupID)
+		}
+	}
+
+	// Register
+	reg.Projects[project] = ProjectConfig{
+		BasePort: basePort,
+		Path:     mainRepo,
+		Group:    groupID,
+	}
+	saveRegistry(reg)
+
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════")
+	fmt.Printf("✓ Project '%s' registered\n\n", project)
+	fmt.Printf("  Path:  %s\n", mainRepo)
+	fmt.Printf("  Port:  %d\n", basePort)
+	if groupID != "" {
+		fmt.Printf("  Group: %s\n", titleCase(groupID))
+	}
+	fmt.Println()
+	fmt.Println("Now you can:")
+	fmt.Println("  slot-cli new        Create a slot")
+	fmt.Println("  slot-cli list       See status")
+}
+
+func resolveSlotName(args []string) string {
+	cwd, _ := os.Getwd()
+	_, project := detectProject(cwd)
+	slotName := filepath.Base(cwd)
+
+	// Check if cwd is already a registered slot
+	reg := loadRegistry()
+	_, cwdIsSlot := reg.Slots[slotName]
+
+	// Only use args as slot identifier if we're NOT already in a slot dir
+	if !cwdIsSlot {
+		for _, arg := range args {
+			if arg == "--force" || arg == "-f" || strings.HasPrefix(arg, "--") {
+				continue
+			}
+			if n, err := strconv.Atoi(arg); err == nil {
+				slotName = fmt.Sprintf("%s-%d", project, n)
+			} else {
+				slotName = fmt.Sprintf("%s-%s", project, arg)
+			}
+			break
+		}
+	}
+	return slotName
+}
+
+func cmdLock(args []string) {
+	slotName := resolveSlotName(args)
+
+	// Collect note from remaining args (skip flags and slot identifier)
+	var noteParts []string
+	skipNext := false
+	for _, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if arg == "--force" || arg == "-f" {
+			continue
+		}
+		// Skip the slot identifier (first non-flag arg)
+		if len(noteParts) == 0 {
+			// Check if this is a slot identifier
+			if _, err := strconv.Atoi(arg); err == nil {
+				continue // it's a number, skip
+			}
+			// Could be a name or the start of the note
+			// If slot name was auto-detected from cwd, this is the note
+			if filepath.Base(func() string { cwd, _ := os.Getwd(); return cwd }()) == slotName {
+				noteParts = append(noteParts, arg)
+				continue
+			}
+			continue
+		}
+		noteParts = append(noteParts, arg)
+	}
+	note := strings.Join(noteParts, " ")
+
+	// If no explicit args, everything after "lock" is the note
+	if len(args) > 0 {
+		// Simple approach: if first arg isn't a number and slot was auto-detected, treat all as note
+		cwd, _ := os.Getwd()
+		if filepath.Base(cwd) == slotName {
+			note = strings.Join(args, " ")
+		}
+	}
+
+	reg := loadRegistry()
+	slot, ok := reg.Slots[slotName]
+	if !ok {
+		fmt.Printf("Error: slot '%s' not found in registry\n", slotName)
+		os.Exit(1)
+	}
+
+	slot.Locked = true
+	slot.LockNote = note
+	reg.Slots[slotName] = slot
+	saveRegistry(reg)
+
+	fmt.Printf("✓ Locked '%s'\n", slotName)
+	if note != "" {
+		fmt.Printf("  Note: %s\n", note)
+	}
+	fmt.Println("\nThis slot cannot be deleted until unlocked:")
+	fmt.Println("  slot-cli unlock")
+}
+
+func cmdUnlock(args []string) {
+	slotName := resolveSlotName(args)
+
+	reg := loadRegistry()
+	slot, ok := reg.Slots[slotName]
+	if !ok {
+		fmt.Printf("Error: slot '%s' not found in registry\n", slotName)
+		os.Exit(1)
+	}
+
+	if !slot.Locked {
+		fmt.Printf("Slot '%s' is not locked\n", slotName)
+		return
+	}
+
+	slot.Locked = false
+	slot.LockNote = ""
+	reg.Slots[slotName] = slot
+	saveRegistry(reg)
+
+	fmt.Printf("✓ Unlocked '%s'\n", slotName)
+}
+
+func cmdGroup(args []string) {
+	if len(args) == 0 {
+		args = []string{"list"}
+	}
+
+	subcmd := args[0]
+	subargs := args[1:]
+
+	switch subcmd {
+	case "list", "ls":
+		reg := loadRegistry()
+		if len(reg.Groups) == 0 {
+			fmt.Println("No groups defined.")
+			fmt.Println("\nCreate one with: slot-cli group create <id> \"<name>\"")
+			return
+		}
+
+		// Collect projects per group
+		groupProjects := make(map[string][]string)
+		ungrouped := []string{}
+		for name, proj := range reg.Projects {
+			if proj.Group != "" {
+				groupProjects[proj.Group] = append(groupProjects[proj.Group], name)
+			} else {
+				ungrouped = append(ungrouped, name)
+			}
+		}
+
+		fmt.Println()
+		for id, group := range reg.Groups {
+			projects := groupProjects[id]
+			fmt.Printf("  %s (%s) — %d projects\n", group.Name, id, len(projects))
+			for _, p := range projects {
+				fmt.Printf("    • %s\n", p)
+			}
+		}
+
+		if len(ungrouped) > 0 {
+			fmt.Printf("\n  Ungrouped — %d projects\n", len(ungrouped))
+			for _, p := range ungrouped {
+				fmt.Printf("    • %s\n", p)
+			}
+		}
+		fmt.Println()
+
+	case "create":
+		if len(subargs) < 2 {
+			fmt.Println("Usage: slot-cli group create <id> \"<display name>\"")
+			fmt.Println("Example: slot-cli group create edgevanta \"Edgevanta\"")
+			os.Exit(1)
+		}
+
+		id := subargs[0]
+		name := subargs[1]
+
+		reg := loadRegistry()
+
+		// Determine order (next available)
+		maxOrder := 0
+		for _, g := range reg.Groups {
+			if g.Order > maxOrder {
+				maxOrder = g.Order
+			}
+		}
+
+		reg.Groups[id] = GroupConfig{
+			Name:  name,
+			Order: maxOrder + 1,
+		}
+		saveRegistry(reg)
+
+		fmt.Printf("✓ Created group '%s' (%s)\n", name, id)
+
+	case "assign":
+		if len(subargs) < 2 {
+			fmt.Println("Usage: slot-cli group assign <project> <group-id>")
+			os.Exit(1)
+		}
+
+		projectName := subargs[0]
+		groupID := subargs[1]
+
+		reg := loadRegistry()
+
+		proj, ok := reg.Projects[projectName]
+		if !ok {
+			fmt.Printf("Error: project '%s' not found in registry\n", projectName)
+			os.Exit(1)
+		}
+
+		if _, ok := reg.Groups[groupID]; !ok {
+			fmt.Printf("Error: group '%s' not found\n", groupID)
+			fmt.Println("Available groups:")
+			for id, g := range reg.Groups {
+				fmt.Printf("  %s — %s\n", id, g.Name)
+			}
+			os.Exit(1)
+		}
+
+		proj.Group = groupID
+		reg.Projects[projectName] = proj
+		saveRegistry(reg)
+
+		fmt.Printf("✓ Assigned '%s' to group '%s'\n", projectName, reg.Groups[groupID].Name)
+
+	default:
+		fmt.Println("Usage:")
+		fmt.Println("  slot-cli group list                     Show groups")
+		fmt.Println("  slot-cli group create <id> \"<name>\"     Create group")
+		fmt.Println("  slot-cli group assign <project> <group>  Assign project")
+	}
+}
+
+// detectGroupFromPath extracts the owner/company folder from a project path.
+// For /Users/user/Projects/<owner>/<project>, returns the owner folder name.
+func detectGroupFromPath(projectPath string) string {
+	// Walk up to find the "Projects" parent
+	parts := strings.Split(projectPath, "/")
+	for i, part := range parts {
+		if part == "Projects" && i+2 < len(parts) {
+			return parts[i+1] // The folder right after "Projects"
+		}
+	}
+	return ""
+}
+
+// titleCase converts "edgevanta" to "Edgevanta"
+func titleCase(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func cmdNew(args []string) {
-	// Parse slot number
+	// Parse slot identifier (number or name)
 	slotNum := 0
+	slotNameArg := ""
+
 	for _, arg := range args {
+		if arg == "--force" || arg == "-f" {
+			continue
+		}
+		// Check if it's a number
 		if n, err := strconv.Atoi(arg); err == nil {
 			slotNum = n
+			break
+		} else {
+			// It's a name
+			slotNameArg = arg
 			break
 		}
 	}
@@ -109,14 +493,23 @@ func cmdNew(args []string) {
 		os.Exit(1)
 	}
 
-	// Auto-increment slot number if not provided
-	if slotNum == 0 {
-		slotNum = findNextSlotNumber(mainRepo, project)
-		fmt.Printf("Auto-assigned slot: %d\n", slotNum)
-	}
+	var slotName, slotPath, branchName string
 
-	slotName := fmt.Sprintf("%s-%d", project, slotNum)
-	slotPath := filepath.Join(filepath.Dir(mainRepo), slotName)
+	if slotNameArg != "" {
+		// Named slot: project-name, branch: name
+		slotName = fmt.Sprintf("%s-%s", project, slotNameArg)
+		slotPath = filepath.Join(filepath.Dir(mainRepo), slotName)
+		branchName = slotNameArg
+	} else {
+		// Numbered slot: auto-increment if not provided
+		if slotNum == 0 {
+			slotNum = findNextSlotNumber(mainRepo, project)
+			fmt.Printf("Auto-assigned slot: %d\n", slotNum)
+		}
+		slotName = fmt.Sprintf("%s-%d", project, slotNum)
+		slotPath = filepath.Join(filepath.Dir(mainRepo), slotName)
+		branchName = fmt.Sprintf("slot-%d", slotNum)
+	}
 
 	// Check if exists
 	if _, err := os.Stat(slotPath); err == nil {
@@ -127,7 +520,6 @@ func cmdNew(args []string) {
 	fmt.Printf("Creating slot: %s\n\n", slotName)
 
 	// Create worktree
-	branchName := fmt.Sprintf("slot-%d", slotNum)
 	runCmd(mainRepo, "git", "worktree", "add", slotPath, "-b", branchName)
 	fmt.Println("✓ Created worktree")
 
@@ -135,8 +527,12 @@ func cmdNew(args []string) {
 	copyGitignored(mainRepo, slotPath)
 	fmt.Println("✓ Copied gitignored files")
 
-	// Scan ports from main and update slot
-	portMap := scanAndAllocatePorts(mainRepo, slotNum)
+	// Scan ports from main and update slot (use slotNum for port offset, default to 1 for named)
+	portOffset := slotNum
+	if portOffset == 0 {
+		portOffset = findNextSlotNumber(mainRepo, project)
+	}
+	portMap := scanAndAllocatePorts(mainRepo, portOffset)
 	if len(portMap) > 0 {
 		updateSlotEnvFiles(slotPath, portMap, slotName)
 		updateConfigFiles(slotPath, portMap)
@@ -151,12 +547,17 @@ func cmdNew(args []string) {
 	installDeps(slotPath)
 
 	// Update registry
-	updateRegistry(slotName, project, slotNum, branchName)
+	updateRegistryFull(slotName, project, slotNum, slotNameArg, branchName)
 
 	// Summary
 	fmt.Println("\n════════════════════════════════════════")
-	fmt.Printf("✓ Slot %d ready\n\n", slotNum)
+	if slotNameArg != "" {
+		fmt.Printf("✓ Slot '%s' ready\n\n", slotNameArg)
+	} else {
+		fmt.Printf("✓ Slot %d ready\n\n", slotNum)
+	}
 	fmt.Printf("  Path: %s\n", slotPath)
+	fmt.Printf("  Branch: %s\n", branchName)
 	if len(portMap) > 0 {
 		fmt.Println("  Ports:")
 		for mainPort, slotPort := range portMap {
@@ -168,34 +569,54 @@ func cmdNew(args []string) {
 	// Copy cd command to clipboard
 	exec.Command("sh", "-c", fmt.Sprintf("echo 'cd %s' | pbcopy", slotPath)).Run()
 	fmt.Println("→ Cmd+T, Cmd+V, Enter")
-	fmt.Println("→ Then: slot start")
+	fmt.Println("→ Then: slot-cli start")
 }
 
 func cmdDelete(args []string) {
 	force := false
 	slotNum := 0
+	slotNameArg := ""
 
 	for _, arg := range args {
 		if arg == "--force" || arg == "-f" {
 			force = true
 		} else if n, err := strconv.Atoi(arg); err == nil {
 			slotNum = n
+		} else if arg != "" {
+			slotNameArg = arg
 		}
 	}
 
-	if slotNum == 0 {
-		fmt.Println("Error: need slot number")
-		fmt.Println("Usage: slot delete <number> [--force]")
+	if slotNum == 0 && slotNameArg == "" {
+		fmt.Println("Error: need slot number or name")
+		fmt.Println("Usage: slot-cli delete <number|name> [--force]")
 		os.Exit(1)
 	}
 
 	cwd, _ := os.Getwd()
 	mainRepo, project := detectProject(cwd)
-	slotName := fmt.Sprintf("%s-%d", project, slotNum)
-	slotPath := filepath.Join(filepath.Dir(mainRepo), slotName)
+
+	var slotName, slotPath string
+	if slotNameArg != "" {
+		slotName = fmt.Sprintf("%s-%s", project, slotNameArg)
+	} else {
+		slotName = fmt.Sprintf("%s-%d", project, slotNum)
+	}
+	slotPath = filepath.Join(filepath.Dir(mainRepo), slotName)
 
 	if _, err := os.Stat(slotPath); os.IsNotExist(err) {
 		fmt.Printf("Error: Slot %s not found\n", slotName)
+		os.Exit(1)
+	}
+
+	// Check lock
+	reg := loadRegistry()
+	if slot, ok := reg.Slots[slotName]; ok && slot.Locked {
+		fmt.Printf("Error: Slot '%s' is LOCKED\n", slotName)
+		if slot.LockNote != "" {
+			fmt.Printf("  Note: %s\n", slot.LockNote)
+		}
+		fmt.Println("\nUnlock first: slot-cli unlock")
 		os.Exit(1)
 	}
 
@@ -218,7 +639,11 @@ func cmdDelete(args []string) {
 	// Update registry
 	removeFromRegistry(slotName)
 
-	fmt.Printf("✓ Deleted slot %d\n", slotNum)
+	if slotNameArg != "" {
+		fmt.Printf("✓ Deleted slot '%s'\n", slotNameArg)
+	} else {
+		fmt.Printf("✓ Deleted slot %d\n", slotNum)
+	}
 }
 
 func cmdList() {
@@ -249,7 +674,7 @@ func cmdList() {
 }
 
 func cmdStart() {
-	cmd := exec.Command("claude", "--dangerously-skip-permissions")
+	cmd := exec.Command("bash", "-lc", "claude --dangerously-skip-permissions")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -257,7 +682,7 @@ func cmdStart() {
 }
 
 func cmdContinue() {
-	cmd := exec.Command("claude", "--continue", "--dangerously-skip-permissions")
+	cmd := exec.Command("bash", "-lc", "claude --continue --dangerously-skip-permissions")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -462,6 +887,1084 @@ func cmdMerge(args []string) {
 	}
 
 	fmt.Printf("\n✓ Merged %s into main\n", branchName)
+}
+
+func cmdDone(args []string) {
+	force := false
+	for _, arg := range args {
+		if arg == "--force" || arg == "-f" {
+			force = true
+		}
+	}
+
+	cwd, _ := os.Getwd()
+	mainRepo, project := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// Must be run from a slot (worktree), not main
+	if mainRepo == cwd {
+		fmt.Println("Error: must run from a slot worktree, not main")
+		os.Exit(1)
+	}
+
+	slotPath := cwd
+	branchName := getBranchName(slotPath)
+	slotName := filepath.Base(slotPath)
+
+	// Check lock
+	reg := loadRegistry()
+	if slot, ok := reg.Slots[slotName]; ok && slot.Locked {
+		fmt.Printf("Error: Slot '%s' is LOCKED\n", slotName)
+		if slot.LockNote != "" {
+			fmt.Printf("  Note: %s\n", slot.LockNote)
+		}
+		fmt.Println("\nUnlock first: slot-cli unlock")
+		os.Exit(1)
+	}
+	_ = project // used later
+
+	fmt.Printf("Completing slot: %s\n\n", slotName)
+
+	// Check for uncommitted changes
+	out, _ := exec.Command("git", "-C", slotPath, "status", "--porcelain").Output()
+	if len(out) > 0 && !force {
+		fmt.Println("Error: uncommitted changes detected")
+		fmt.Println("Commit your changes or use --force to skip")
+		os.Exit(1)
+	}
+
+	// Stop docker first
+	fmt.Println("Stopping docker...")
+	stopDocker(slotPath)
+	fmt.Println("✓ Docker stopped")
+
+	// Go to main and merge
+	fmt.Printf("\nMerging %s into main...\n", branchName)
+	cmd := exec.Command("git", "-C", mainRepo, "merge", branchName)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Println("\n⚠ Merge conflict!")
+		fmt.Println("Resolve conflicts in main, then manually delete slot:")
+		fmt.Printf("  cd %s\n", mainRepo)
+		fmt.Println("  git commit")
+		fmt.Printf("  slot-cli delete %s\n", extractSlotIdentifier(slotName, project))
+		os.Exit(1)
+	}
+	fmt.Printf("✓ Merged %s into main\n", branchName)
+
+	// Remove worktree and branch
+	fmt.Println("\nCleaning up...")
+	exec.Command("git", "-C", mainRepo, "worktree", "remove", slotPath, "--force").Run()
+	exec.Command("git", "-C", mainRepo, "branch", "-D", branchName).Run()
+	fmt.Println("✓ Removed worktree and branch")
+
+	// Update registry
+	removeFromRegistry(slotName)
+
+	fmt.Printf("\n✓ Slot done! Now in main with merged changes.\n")
+	fmt.Printf("\n  cd %s\n", mainRepo)
+}
+
+func cmdPR(args []string) {
+	cwd, _ := os.Getwd()
+	mainRepo, _ := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// Can run from slot or detect slot from args
+	slotPath := cwd
+	if mainRepo == cwd {
+		fmt.Println("Error: must run from a slot worktree")
+		os.Exit(1)
+	}
+
+	branchName := getBranchName(slotPath)
+	if branchName == "" {
+		fmt.Println("Error: could not detect branch")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Creating PR for branch: %s\n\n", branchName)
+
+	// Push to origin with upstream tracking
+	fmt.Println("Pushing to origin...")
+	cmd := exec.Command("git", "-C", slotPath, "push", "-u", "origin", branchName)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Println("Error: failed to push")
+		os.Exit(1)
+	}
+	fmt.Println("✓ Pushed to origin")
+
+	// Create PR using gh
+	fmt.Println("\nCreating PR...")
+	cmd = exec.Command("gh", "pr", "create", "--fill")
+	cmd.Dir = slotPath
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Println("\n⚠ PR creation failed (may already exist)")
+		fmt.Println("View existing PRs: gh pr list")
+	}
+}
+
+func cmdClean(args []string) {
+	doClean := false
+	force := false
+
+	for _, arg := range args {
+		if arg == "--do" {
+			doClean = true
+		} else if arg == "--force" || arg == "-f" {
+			force = true
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println("                        SLOT CLEAN")
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	cwd, _ := os.Getwd()
+	mainRepo, _ := detectProject(cwd)
+	if mainRepo == "" {
+		mainRepo = cwd
+	}
+	parentDir := filepath.Dir(mainRepo)
+
+	reg := loadRegistry()
+
+	var safeTmux []string
+	var safeWorktrees []string
+	var blockedItems []string
+	var warningItems []string
+
+	// 1. Check tmux sessions
+	fmt.Println("Scanning tmux sessions...")
+	out, _ := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	sessions := strings.Split(strings.TrimSpace(string(out)), "\n")
+
+	for _, session := range sessions {
+		if session == "" {
+			continue
+		}
+		// Check if Claude is running in this session
+		paneOut, _ := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_current_command}").Output()
+		if strings.Contains(strings.ToLower(string(paneOut)), "claude") {
+			blockedItems = append(blockedItems, fmt.Sprintf("tmux:%s - Claude running", session))
+		} else {
+			safeTmux = append(safeTmux, session)
+			fmt.Printf("  ✓ tmux:%s - safe to kill\n", session)
+		}
+	}
+	if len(sessions) == 0 || (len(sessions) == 1 && sessions[0] == "") {
+		fmt.Println("  (no tmux sessions)")
+	}
+
+	fmt.Println()
+
+	// 2. Check git worktrees
+	fmt.Println("Scanning worktrees...")
+	entries, _ := os.ReadDir(parentDir)
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		wtPath := filepath.Join(parentDir, entry.Name())
+
+		// Skip if it's the main repo
+		if wtPath == mainRepo {
+			continue
+		}
+
+		// Check if it's a slot/worktree pattern
+		if !strings.Contains(entry.Name(), "-") {
+			continue
+		}
+
+		// Check if it's a git worktree
+		gitFile := filepath.Join(wtPath, ".git")
+		info, err := os.Stat(gitFile)
+		if err != nil || info.IsDir() {
+			continue
+		}
+
+		branch := getBranchName(wtPath)
+
+		// Check 1: Uncommitted changes
+		uncommittedOut, _ := exec.Command("git", "-C", wtPath, "status", "--porcelain").Output()
+		uncommitted := len(strings.TrimSpace(string(uncommittedOut))) > 0
+
+		// Check 2: Unpushed commits
+		unpushedOut, _ := exec.Command("git", "-C", wtPath, "log", "origin/"+branch+"..HEAD", "--oneline").Output()
+		unpushed := len(strings.TrimSpace(string(unpushedOut))) > 0
+
+		// Check 3: Unmerged with main
+		unmergedOut, _ := exec.Command("git", "-C", wtPath, "log", "origin/main..HEAD", "--oneline").Output()
+		if len(unmergedOut) == 0 {
+			unmergedOut, _ = exec.Command("git", "-C", wtPath, "log", "origin/master..HEAD", "--oneline").Output()
+		}
+		unmergedCount := 0
+		if len(strings.TrimSpace(string(unmergedOut))) > 0 {
+			unmergedCount = len(strings.Split(strings.TrimSpace(string(unmergedOut)), "\n"))
+		}
+
+		wtName := entry.Name()
+
+		// Check lock
+		if slot, ok := reg.Slots[wtName]; ok && slot.Locked {
+			note := ""
+			if slot.LockNote != "" {
+				note = " — " + slot.LockNote
+			}
+			blockedItems = append(blockedItems, fmt.Sprintf("%s (%s) - LOCKED%s", wtName, branch, note))
+			continue
+		}
+
+		if uncommitted {
+			blockedItems = append(blockedItems, fmt.Sprintf("%s (%s) - DIRTY: uncommitted files", wtName, branch))
+		} else if unpushed {
+			blockedItems = append(blockedItems, fmt.Sprintf("%s (%s) - UNPUSHED: commits not on remote", wtName, branch))
+		} else if unmergedCount > 0 {
+			warningItems = append(warningItems, fmt.Sprintf("%s (%s) - UNMERGED: %d commits not in main", wtName, branch, unmergedCount))
+			if force {
+				safeWorktrees = append(safeWorktrees, wtPath)
+			}
+		} else {
+			safeWorktrees = append(safeWorktrees, wtPath)
+			fmt.Printf("  ✓ %s (%s) - CLEAN: merged to main\n", wtName, branch)
+		}
+	}
+
+	if len(safeWorktrees) == 0 && len(blockedItems) == 0 && len(warningItems) == 0 {
+		fmt.Println("  (no worktrees found)")
+	}
+
+	fmt.Println()
+
+	// 3. Check for orphan registry entries (slot in registry but no directory on disk)
+	var orphanSlots []string
+	fmt.Println("Scanning registry for orphans...")
+	for slotName, slotCfg := range reg.Slots {
+		projectCfg, ok := reg.Projects[slotCfg.Project]
+		if !ok {
+			orphanSlots = append(orphanSlots, slotName)
+			fmt.Printf("  ✗ %s - ORPHAN: project '%s' not in registry\n", slotName, slotCfg.Project)
+			continue
+		}
+		slotDir := filepath.Join(filepath.Dir(projectCfg.Path), slotName)
+		if _, err := os.Stat(slotDir); os.IsNotExist(err) {
+			orphanSlots = append(orphanSlots, slotName)
+			fmt.Printf("  ✗ %s - ORPHAN: directory not found (%s)\n", slotName, slotDir)
+		}
+	}
+	if len(orphanSlots) == 0 {
+		fmt.Println("  (no orphans)")
+	}
+
+	fmt.Println()
+
+	// 4. Summary
+	fmt.Println("════════════════════════════════════════════════════════════════")
+
+	if len(blockedItems) > 0 {
+		fmt.Println("\033[31mBLOCKED - cannot clean:\033[0m")
+		for _, item := range blockedItems {
+			fmt.Printf("  ✗ %s\n", item)
+		}
+		fmt.Println()
+	}
+
+	if len(warningItems) > 0 {
+		fmt.Println("\033[33mWARNINGS - unmerged branches:\033[0m")
+		for _, item := range warningItems {
+			fmt.Printf("  ⚠ %s\n", item)
+		}
+		fmt.Println("  (use --force to include these)")
+		fmt.Println()
+	}
+
+	if len(orphanSlots) > 0 {
+		fmt.Println("\033[35mORPHAN REGISTRY ENTRIES:\033[0m")
+		for _, name := range orphanSlots {
+			fmt.Printf("  ✗ %s\n", name)
+		}
+		fmt.Println()
+	}
+
+	safeCount := len(safeTmux) + len(safeWorktrees) + len(orphanSlots)
+
+	if safeCount == 0 {
+		fmt.Println("\033[36mNothing safe to clean.\033[0m")
+		return
+	}
+
+	fmt.Printf("\033[32mSAFE TO CLEAN: %d items\033[0m\n", safeCount)
+
+	if !doClean {
+		fmt.Println()
+		fmt.Println("This is a dry run. To actually clean, run:")
+		fmt.Println("  slot-cli clean --do")
+		if len(warningItems) > 0 {
+			fmt.Println("  slot-cli clean --do --force  (include unmerged branches)")
+		}
+		return
+	}
+
+	// Actually clean
+	fmt.Println()
+	fmt.Println("\033[36mCleaning...\033[0m")
+
+	// Kill tmux sessions
+	for _, session := range safeTmux {
+		if err := exec.Command("tmux", "kill-session", "-t", session).Run(); err == nil {
+			fmt.Printf("  ✓ Killed tmux:%s\n", session)
+		}
+	}
+
+	// Remove orphan registry entries
+	for _, slotName := range orphanSlots {
+		removeFromRegistry(slotName)
+		fmt.Printf("  ✓ Removed orphan registry entry: %s\n", slotName)
+	}
+
+	// Remove worktrees
+	for _, wtPath := range safeWorktrees {
+		wtName := filepath.Base(wtPath)
+		branch := getBranchName(wtPath)
+
+		// Stop docker if running
+		stopDocker(wtPath)
+
+		// Find main repo
+		gitContent, err := os.ReadFile(filepath.Join(wtPath, ".git"))
+		if err != nil {
+			continue
+		}
+		line := strings.TrimSpace(string(gitContent))
+		if !strings.HasPrefix(line, "gitdir:") {
+			continue
+		}
+		gitdir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+		idx := strings.Index(gitdir, "/.git/worktrees")
+		if idx < 0 {
+			continue
+		}
+		wtMainRepo := gitdir[:idx]
+
+		// Remove worktree and branch
+		exec.Command("git", "-C", wtMainRepo, "worktree", "remove", wtPath, "--force").Run()
+		exec.Command("git", "-C", wtMainRepo, "branch", "-D", branch).Run()
+		removeFromRegistry(wtName)
+		fmt.Printf("  ✓ Removed worktree: %s\n", wtName)
+	}
+
+	fmt.Println()
+	fmt.Println("\033[32mDone!\033[0m")
+}
+
+type ClaudeProcess struct {
+	PID     int
+	CWD     string
+	Project string
+	Branch  string
+	Runtime string
+}
+
+func getClaudeProcesses() []ClaudeProcess {
+	out, err := exec.Command("pgrep", "-f", "claude").Output()
+	if err != nil {
+		return nil
+	}
+
+	seen := make(map[string]bool) // dedupe by cwd
+	var processes []ClaudeProcess
+
+	for _, pidStr := range strings.Fields(string(out)) {
+		pid, _ := strconv.Atoi(pidStr)
+		if pid == 0 {
+			continue
+		}
+
+		// Get cwd
+		lsofOut, err := exec.Command("bash", "-c", fmt.Sprintf("lsof -p %d 2>/dev/null | grep cwd | awk '{print $NF}'", pid)).Output()
+		if err != nil {
+			continue
+		}
+		cwd := strings.TrimSpace(string(lsofOut))
+		if cwd == "" || cwd == "/" || !strings.HasPrefix(cwd, "/Users") {
+			continue
+		}
+
+		if seen[cwd] {
+			continue
+		}
+		seen[cwd] = true
+
+		// Get branch
+		branchOut, _ := exec.Command("git", "-C", cwd, "branch", "--show-current").Output()
+		branch := strings.TrimSpace(string(branchOut))
+
+		// Get runtime
+		runtimeOut, _ := exec.Command("ps", "-p", pidStr, "-o", "etime=").Output()
+		runtime := strings.TrimSpace(string(runtimeOut))
+
+		// Extract project name from path
+		project := filepath.Base(cwd)
+
+		processes = append(processes, ClaudeProcess{
+			PID:     pid,
+			CWD:     cwd,
+			Project: project,
+			Branch:  branch,
+			Runtime: runtime,
+		})
+	}
+	return processes
+}
+
+func cmdCleanClaude(args []string) {
+	killOrphans := false
+	killAll := false
+	dryRun := true
+
+	for _, arg := range args {
+		if arg == "--orphans" {
+			killOrphans = true
+			dryRun = false
+		} else if arg == "--all" {
+			killAll = true
+			dryRun = false
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println("                     CLAUDE CLEANUP")
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	processes := getClaudeProcesses()
+	if len(processes) == 0 {
+		fmt.Println("No Claude instances running.")
+		return
+	}
+
+	registry := loadRegistry()
+
+	// Build set of known paths from registry
+	knownPaths := make(map[string]string) // path -> label
+	for name, project := range registry.Projects {
+		knownPaths[project.Path] = name + " (main)"
+	}
+	for name, slot := range registry.Slots {
+		project := registry.Projects[slot.Project]
+		if project.Path != "" {
+			slotPath := filepath.Join(filepath.Dir(project.Path), name)
+			knownPaths[slotPath] = name + " (" + slot.Branch + ")"
+		}
+	}
+
+	var attached []ClaudeProcess
+	var orphans []ClaudeProcess
+
+	for _, p := range processes {
+		matched := false
+		for knownPath, label := range knownPaths {
+			if p.CWD == knownPath || strings.HasPrefix(p.CWD, knownPath+"/") {
+				p.Project = label
+				attached = append(attached, p)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			orphans = append(orphans, p)
+		}
+	}
+
+	fmt.Printf("\033[32mATTACHED TO SLOTS (%d):\033[0m\n", len(attached))
+	for _, p := range attached {
+		fmt.Printf("  • pid %d  %s  branch:%s  %s\n", p.PID, p.Project, p.Branch, p.Runtime)
+	}
+	if len(attached) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	fmt.Printf("\033[33mUNREGISTERED (%d):\033[0m\n", len(orphans))
+	for _, p := range orphans {
+		fmt.Printf("  • pid %d  %s  branch:%s  %s\n", p.PID, p.Project, p.Branch, p.Runtime)
+	}
+	if len(orphans) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	fmt.Println("════════════════════════════════════════════════════════════════")
+
+	if dryRun {
+		fmt.Println("This is a dry run. To stop instances:")
+		fmt.Println("  slot-cli clean claude --orphans  (stop unregistered only)")
+		fmt.Println("  slot-cli clean claude --all      (stop all claude instances)")
+		return
+	}
+
+	var toKill []ClaudeProcess
+	if killAll {
+		toKill = processes
+		fmt.Printf("\n\033[36mStopping ALL %d claude instances...\033[0m\n", len(toKill))
+	} else if killOrphans {
+		toKill = orphans
+		fmt.Printf("\n\033[36mStopping %d unregistered claude instances...\033[0m\n", len(toKill))
+	}
+
+	for _, p := range toKill {
+		if err := exec.Command("kill", strconv.Itoa(p.PID)).Run(); err == nil {
+			fmt.Printf("  ✓ Stopped %s (pid %d)\n", p.Project, p.PID)
+		} else {
+			fmt.Printf("  ✗ Failed to stop %s (pid %d)\n", p.Project, p.PID)
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("\033[32mDone!\033[0m")
+}
+
+type DockerProcess struct {
+	Name    string
+	Ports   string
+	Status  string
+	Image   string
+	Project string // matched project/slot from registry
+}
+
+func getDockerProcesses() []DockerProcess {
+	out, err := exec.Command("docker", "ps", "--format", "{{.Names}}|{{.Ports}}|{{.Status}}|{{.Image}}").Output()
+	if err != nil {
+		return nil
+	}
+
+	var processes []DockerProcess
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 4)
+		if len(parts) < 4 {
+			continue
+		}
+		processes = append(processes, DockerProcess{
+			Name:   parts[0],
+			Ports:  parts[1],
+			Status: parts[2],
+			Image:  parts[3],
+		})
+	}
+	return processes
+}
+
+func cmdCleanDocker(args []string) {
+	killOrphans := false
+	killAll := false
+	dryRun := true
+
+	for _, arg := range args {
+		if arg == "--orphans" {
+			killOrphans = true
+			dryRun = false
+		} else if arg == "--all" {
+			killAll = true
+			dryRun = false
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println("                     DOCKER CLEANUP")
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	processes := getDockerProcesses()
+	if len(processes) == 0 {
+		fmt.Println("No docker containers running.")
+		return
+	}
+
+	registry := loadRegistry()
+
+	// Build set of known prefixes from registry (projects + slots)
+	knownPrefixes := make(map[string]string) // prefix -> label
+	for name := range registry.Projects {
+		knownPrefixes[name] = name + " (main)"
+	}
+	for name, slot := range registry.Slots {
+		knownPrefixes[name] = name + " (" + slot.Branch + ")"
+	}
+
+	var attached []DockerProcess
+	var orphans []DockerProcess
+
+	for _, p := range processes {
+		matched := false
+		for prefix, label := range knownPrefixes {
+			if strings.HasPrefix(p.Name, prefix+"-") || p.Name == prefix {
+				p.Project = label
+				attached = append(attached, p)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			orphans = append(orphans, p)
+		}
+	}
+
+	fmt.Printf("\033[32mATTACHED TO SLOTS (%d):\033[0m\n", len(attached))
+	for _, p := range attached {
+		fmt.Printf("  • %s → %s\n", p.Name, p.Project)
+	}
+	if len(attached) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	fmt.Printf("\033[33mORPHAN CONTAINERS (%d):\033[0m\n", len(orphans))
+	for _, p := range orphans {
+		fmt.Printf("  • %s (%s)\n", p.Name, p.Image)
+	}
+	if len(orphans) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	fmt.Println("════════════════════════════════════════════════════════════════")
+
+	if dryRun {
+		fmt.Println("This is a dry run. To stop containers:")
+		fmt.Println("  slot-cli clean docker --orphans  (stop orphans only)")
+		fmt.Println("  slot-cli clean docker --all      (stop all containers)")
+		fmt.Println()
+		fmt.Println("Note: volumes are preserved (no -v flag).")
+		return
+	}
+
+	var toStop []DockerProcess
+	if killAll {
+		toStop = processes
+		fmt.Printf("\n\033[36mStopping ALL %d containers...\033[0m\n", len(toStop))
+	} else if killOrphans {
+		toStop = orphans
+		fmt.Printf("\n\033[36mStopping %d orphan containers...\033[0m\n", len(toStop))
+	}
+
+	for _, p := range toStop {
+		if err := exec.Command("docker", "stop", p.Name).Run(); err == nil {
+			fmt.Printf("  ✓ Stopped %s\n", p.Name)
+		} else {
+			fmt.Printf("  ✗ Failed to stop %s\n", p.Name)
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("\033[32mDone! (volumes preserved)\033[0m")
+}
+
+type StorybookProcess struct {
+	PID     int
+	Port    int
+	Project string
+	CWD     string
+}
+
+func getStorybookProcesses() []StorybookProcess {
+	out, err := exec.Command("bash", "-c", `ps aux | grep "storybook/dist/bin/dispatcher.js" | grep -v grep`).Output()
+	if err != nil {
+		return nil
+	}
+
+	var processes []StorybookProcess
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, _ := strconv.Atoi(fields[1])
+
+		// Find -p PORT
+		port := 6006
+		for i, f := range fields {
+			if f == "-p" && i+1 < len(fields) {
+				port, _ = strconv.Atoi(fields[i+1])
+				break
+			}
+		}
+
+		// Extract project from path
+		re := regexp.MustCompile(`/Projects/[^/]+/([^/]+)`)
+		matches := re.FindStringSubmatch(line)
+		project := "unknown"
+		if len(matches) > 1 {
+			project = matches[1]
+		}
+
+		// Extract cwd
+		cwdRe := regexp.MustCompile(`(/Users/[^\s]+)/node_modules`)
+		cwdMatches := cwdRe.FindStringSubmatch(line)
+		cwd := ""
+		if len(cwdMatches) > 1 {
+			cwd = strings.Replace(cwdMatches[1], "/apps/web", "", 1)
+		}
+
+		processes = append(processes, StorybookProcess{
+			PID:     pid,
+			Port:    port,
+			Project: project,
+			CWD:     cwd,
+		})
+	}
+	return processes
+}
+
+func getConfiguredStorybookPorts() map[int]string {
+	ports := make(map[int]string)
+	registry := loadRegistry()
+
+	for name, project := range registry.Projects {
+		// Read from main project
+		port := readEnvPort(project.Path, "STORYBOOK_PORT")
+		if port > 0 {
+			ports[port] = name
+		}
+	}
+
+	for name, slot := range registry.Slots {
+		project := registry.Projects[slot.Project]
+		if project.Path == "" {
+			continue
+		}
+		slotPath := filepath.Join(filepath.Dir(project.Path), name)
+		port := readEnvPort(slotPath, "STORYBOOK_PORT")
+		if port > 0 {
+			ports[port] = name
+		}
+	}
+
+	return ports
+}
+
+func readEnvPort(basePath, varName string) int {
+	subdirs := []string{"", "apps/web", "packages/ui"}
+	envFiles := []string{".env.local", ".env"}
+
+	for _, subdir := range subdirs {
+		for _, envFile := range envFiles {
+			path := filepath.Join(basePath, subdir, envFile)
+			content, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			re := regexp.MustCompile(varName + `=["']?(\d+)["']?`)
+			matches := re.FindSubmatch(content)
+			if len(matches) > 1 {
+				port, _ := strconv.Atoi(string(matches[1]))
+				return port
+			}
+		}
+	}
+	return 0
+}
+
+func cmdCleanStorybook(args []string) {
+	killOrphans := false
+	killAll := false
+	dryRun := true
+
+	for _, arg := range args {
+		if arg == "--orphans" {
+			killOrphans = true
+			dryRun = false
+		} else if arg == "--all" {
+			killAll = true
+			dryRun = false
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println("                     STORYBOOK CLEANUP")
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	processes := getStorybookProcesses()
+	if len(processes) == 0 {
+		fmt.Println("No storybook processes running.")
+		return
+	}
+
+	configuredPorts := getConfiguredStorybookPorts()
+
+	var attached []StorybookProcess
+	var orphans []StorybookProcess
+
+	for _, p := range processes {
+		if _, ok := configuredPorts[p.Port]; ok {
+			attached = append(attached, p)
+		} else {
+			orphans = append(orphans, p)
+		}
+	}
+
+	// Show attached
+	fmt.Printf("\033[32mATTACHED TO SLOTS (%d):\033[0m\n", len(attached))
+	for _, p := range attached {
+		slot := configuredPorts[p.Port]
+		fmt.Printf("  • %s :%d (pid %d) → %s\n", p.Project, p.Port, p.PID, slot)
+	}
+	if len(attached) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	// Show orphans
+	fmt.Printf("\033[33mORPHAN STORYBOOKS (%d):\033[0m\n", len(orphans))
+	for _, p := range orphans {
+		fmt.Printf("  • %s :%d (pid %d)\n", p.Project, p.Port, p.PID)
+	}
+	if len(orphans) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	fmt.Println("════════════════════════════════════════════════════════════════")
+
+	if dryRun {
+		fmt.Println("This is a dry run. To kill processes:")
+		fmt.Println("  slot-cli clean storybook --orphans  (kill orphans only)")
+		fmt.Println("  slot-cli clean storybook --all      (kill all storybooks)")
+		return
+	}
+
+	var toKill []StorybookProcess
+	if killAll {
+		toKill = processes
+		fmt.Printf("\n\033[36mKilling ALL %d storybooks...\033[0m\n", len(toKill))
+	} else if killOrphans {
+		toKill = orphans
+		fmt.Printf("\n\033[36mKilling %d orphan storybooks...\033[0m\n", len(toKill))
+	}
+
+	for _, p := range toKill {
+		if err := exec.Command("kill", strconv.Itoa(p.PID)).Run(); err == nil {
+			fmt.Printf("  ✓ Killed %s :%d (pid %d)\n", p.Project, p.Port, p.PID)
+		} else {
+			fmt.Printf("  ✗ Failed to kill %s :%d (pid %d)\n", p.Project, p.Port, p.PID)
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("\033[32mDone!\033[0m")
+}
+
+type WebServerProcess struct {
+	PID     int
+	Port    int
+	Project string
+	CWD     string
+}
+
+func getWebServerProcesses() []WebServerProcess {
+	// Look for Next.js dev servers (the main worker process)
+	out, err := exec.Command("bash", "-c", `ps aux | grep -E "next-server|next dev" | grep -v grep`).Output()
+	if err != nil {
+		return nil
+	}
+
+	var processes []WebServerProcess
+	seen := make(map[int]bool)
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, _ := strconv.Atoi(fields[1])
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+
+		// Find -p PORT or --port PORT
+		port := 3000
+		for i, f := range fields {
+			if (f == "-p" || f == "--port") && i+1 < len(fields) {
+				p, err := strconv.Atoi(fields[i+1])
+				if err == nil {
+					port = p
+				}
+				break
+			}
+		}
+
+		// Extract project from path
+		re := regexp.MustCompile(`/Projects/[^/]+/([^/]+)`)
+		matches := re.FindStringSubmatch(line)
+		project := "unknown"
+		if len(matches) > 1 {
+			project = matches[1]
+		}
+
+		// Extract cwd
+		cwdRe := regexp.MustCompile(`(/Users/[^\s]+)`)
+		cwdMatches := cwdRe.FindStringSubmatch(line)
+		cwd := ""
+		if len(cwdMatches) > 1 {
+			cwd = cwdMatches[1]
+		}
+
+		processes = append(processes, WebServerProcess{
+			PID:     pid,
+			Port:    port,
+			Project: project,
+			CWD:     cwd,
+		})
+	}
+	return processes
+}
+
+func cmdCleanWeb(args []string) {
+	killOrphans := false
+	killAll := false
+	dryRun := true
+
+	for _, arg := range args {
+		if arg == "--orphans" {
+			killOrphans = true
+			dryRun = false
+		} else if arg == "--all" {
+			killAll = true
+			dryRun = false
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println("                     WEB SERVER CLEANUP")
+	fmt.Println("════════════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	processes := getWebServerProcesses()
+	if len(processes) == 0 {
+		fmt.Println("No web server processes running.")
+		return
+	}
+
+	configuredPorts := make(map[int]string)
+	registry := loadRegistry()
+	for name, project := range registry.Projects {
+		port := readEnvPort(project.Path, "PORT")
+		if port > 0 {
+			configuredPorts[port] = name
+		}
+	}
+	for name, slot := range registry.Slots {
+		project := registry.Projects[slot.Project]
+		if project.Path == "" {
+			continue
+		}
+		slotPath := filepath.Join(filepath.Dir(project.Path), name)
+		port := readEnvPort(slotPath, "PORT")
+		if port > 0 {
+			configuredPorts[port] = name
+		}
+	}
+
+	var attached []WebServerProcess
+	var orphans []WebServerProcess
+
+	for _, p := range processes {
+		if _, ok := configuredPorts[p.Port]; ok {
+			attached = append(attached, p)
+		} else {
+			orphans = append(orphans, p)
+		}
+	}
+
+	fmt.Printf("\033[32mATTACHED TO SLOTS (%d):\033[0m\n", len(attached))
+	for _, p := range attached {
+		slot := configuredPorts[p.Port]
+		fmt.Printf("  • %s :%d (pid %d) → %s\n", p.Project, p.Port, p.PID, slot)
+	}
+	if len(attached) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	fmt.Printf("\033[33mORPHAN WEB SERVERS (%d):\033[0m\n", len(orphans))
+	for _, p := range orphans {
+		fmt.Printf("  • %s :%d (pid %d)\n", p.Project, p.Port, p.PID)
+	}
+	if len(orphans) == 0 {
+		fmt.Println("  (none)")
+	}
+	fmt.Println()
+
+	fmt.Println("════════════════════════════════════════════════════════════════")
+
+	if dryRun {
+		fmt.Println("This is a dry run. To kill processes:")
+		fmt.Println("  slot-cli clean web --orphans  (kill orphans only)")
+		fmt.Println("  slot-cli clean web --all      (kill all web servers)")
+		return
+	}
+
+	var toKill []WebServerProcess
+	if killAll {
+		toKill = processes
+		fmt.Printf("\n\033[36mKilling ALL %d web servers...\033[0m\n", len(toKill))
+	} else if killOrphans {
+		toKill = orphans
+		fmt.Printf("\n\033[36mKilling %d orphan web servers...\033[0m\n", len(toKill))
+	}
+
+	skipped := 0
+	for _, p := range toKill {
+		// Never kill the exceder dashboard
+		if p.Project == "exceder" || (p.CWD != "" && strings.Contains(p.CWD, "exceder")) {
+			fmt.Printf("  ⊘ Skipped %s :%d (pid %d) — exceder dashboard\n", p.Project, p.Port, p.PID)
+			skipped++
+			continue
+		}
+		if err := exec.Command("kill", strconv.Itoa(p.PID)).Run(); err == nil {
+			fmt.Printf("  ✓ Killed %s :%d (pid %d)\n", p.Project, p.Port, p.PID)
+		} else {
+			fmt.Printf("  ✗ Failed to kill %s :%d (pid %d)\n", p.Project, p.Port, p.PID)
+		}
+	}
+
+	if skipped > 0 {
+		fmt.Printf("\n\033[36m(%d exceder processes skipped)\033[0m\n", skipped)
+	}
+	fmt.Println()
+	fmt.Println("\033[32mDone!\033[0m")
 }
 
 func cmdVerify() {
@@ -1566,6 +3069,7 @@ func loadRegistry() *Registry {
 	data, err := os.ReadFile(registryPath)
 	if err != nil {
 		return &Registry{
+			Groups:   make(map[string]GroupConfig),
 			Projects: make(map[string]ProjectConfig),
 			Slots:    make(map[string]SlotConfig),
 		}
@@ -1574,11 +3078,15 @@ func loadRegistry() *Registry {
 	var reg Registry
 	if json.Unmarshal(data, &reg) != nil {
 		return &Registry{
+			Groups:   make(map[string]GroupConfig),
 			Projects: make(map[string]ProjectConfig),
 			Slots:    make(map[string]SlotConfig),
 		}
 	}
 
+	if reg.Groups == nil {
+		reg.Groups = make(map[string]GroupConfig)
+	}
 	if reg.Projects == nil {
 		reg.Projects = make(map[string]ProjectConfig)
 	}
@@ -1595,14 +3103,33 @@ func saveRegistry(reg *Registry) {
 }
 
 func updateRegistry(slotName, project string, number int, branch string) {
+	updateRegistryFull(slotName, project, number, "", branch)
+}
+
+func updateRegistryFull(slotName, project string, number int, name, branch string) {
 	reg := loadRegistry()
 	reg.Slots[slotName] = SlotConfig{
 		Project:   project,
 		Number:    number,
+		Name:      name,
 		Branch:    branch,
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 	saveRegistry(reg)
+}
+
+// extractSlotIdentifier extracts the slot number or name from a slot directory name
+func extractSlotIdentifier(slotName, project string) string {
+	prefix := project + "-"
+	if !strings.HasPrefix(slotName, prefix) {
+		return slotName
+	}
+	suffix := strings.TrimPrefix(slotName, prefix)
+	// Check if it's a number
+	if _, err := strconv.Atoi(suffix); err == nil {
+		return suffix
+	}
+	return suffix
 }
 
 func removeFromRegistry(slotName string) {

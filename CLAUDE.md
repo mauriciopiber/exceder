@@ -1,34 +1,37 @@
-# Exceder CLI
+# slot-cli
 
-Git worktree management for parallel Claude sessions.
+Git worktree management for parallel Claude sessions. Use `slot-cli` directly in Claude's shell (aliases don't work in non-interactive shells).
 
-## Workspace (named branches)
-
-| Command | Where | What |
-|---------|-------|------|
-| `xc workspace new <name>` | main repo | Create worktree |
-| `xc workspace start` | worktree | Fresh Claude session |
-| `xc workspace continue` | worktree | Resume last session |
-| `xc workspace done` | worktree | Merge to main + cleanup |
-| `xc workspace pr` | worktree | Push + create PR |
-| `xc workspace kill` | worktree | Delete without merge |
-
-## Slot (numbered, cross-project)
-
-Powered by `slot-cli` (Go binary at `~/bin/slot-cli`).
+## Commands
 
 | Command | Where | What |
 |---------|-------|------|
-| `xc slot new [N]` | main repo | Create slot with port allocation + DB clone |
-| `xc slot start` | slot dir | Fresh Claude session |
-| `xc slot continue` | slot dir | Resume last session |
-| `xc slot delete <N>` | main repo | Delete slot |
-| `xc slot list` | anywhere | Show running Claude instances |
-| `xc slot check` | slot dir | Validate slot config |
-| `xc slot sync` | slot dir | Rebase slot branch on main |
-| `xc slot db-sync` | slot dir | Clone database from main to slot |
+| `slot-cli new [N\|name]` | main repo | Create slot (number or name, auto-increments if omitted) |
+| `slot-cli delete <N\|name>` | main repo | Delete slot |
+| `slot-cli done` | slot dir | Merge into main + cleanup |
+| `slot-cli pr` | slot dir | Push + create PR |
+| `slot-cli start` | slot dir | Fresh Claude session |
+| `slot-cli continue` | slot dir | Resume last session |
+| `slot-cli sync` | slot dir | Rebase slot branch on main |
+| `slot-cli db-sync` | slot dir | Clone database from main to slot |
+| `slot-cli list` | anywhere | Show running Claude instances |
+| `slot-cli clean` | anywhere | Scan for stale worktrees/sessions |
 
-**Auto features:**
+## Slot Types
+
+**Numbered slots** (default):
+```bash
+slot-cli new        # Auto: exceder-1, branch: slot-1
+slot-cli new 2      # exceder-2, branch: slot-2
+```
+
+**Named slots**:
+```bash
+slot-cli new auth   # exceder-auth, branch: auth
+```
+
+## Auto Features
+
 - Scans `.env` files for ports, allocates slot-specific ports
 - Updates `docker-compose.yml` container names
 - Starts docker and clones database from main
@@ -39,27 +42,43 @@ See `docs/multi-slot-requirements.md` for project setup.
 ## Clean (safe cleanup)
 
 ```bash
-xc clean              # Dry run
-xc clean --do         # Execute safe items
-xc clean --do --force # Include unmerged branches
+slot-cli clean              # Dry run
+slot-cli clean --do         # Execute safe items
+slot-cli clean --do --force # Include unmerged branches
 ```
 
 Safety checks: uncommitted changes, unpushed commits, unmerged with main.
 
+## Building slot-cli
+
+After modifying `cli/slot-cli/main.go`, always build AND sign:
+
+```bash
+cd cli/slot-cli && go build -o slot-cli . && codesign -f -s - slot-cli && cp slot-cli ~/bin/slot-cli && codesign -f -s - ~/bin/slot-cli
+```
+
+macOS kills unsigned Go binaries (signal 9). The `codesign -f -s -` ad-hoc signs it. Must sign both the local build and the installed copy.
+
+## Groups
+
+```bash
+slot-cli group list                        # Show groups and projects
+slot-cli group create <id> "<name>"        # Create a group
+slot-cli group assign <project> <group>    # Assign project to group
+slot-cli init                              # Auto-detects group from /Projects/<owner>/<project>
+```
+
 ## Quick Reference
 
 ```bash
-# Workspace flow
-xc workspace new feature-name  # → Cmd+T, Cmd+V, Enter
-xc workspace start
-# work...
-xc workspace done
+# Create slot
+slot-cli new          # → Cmd+T, Cmd+V, Enter
+slot-cli start
 
-# Slot flow
-xc slot new          # → Cmd+T, Cmd+V, Enter
-xc slot start
-# work...
-xc slot delete 1
+# When done
+slot-cli done         # Merges and cleans up
+
+# Or for PR workflow
+slot-cli pr           # Push + create PR
+slot-cli delete 1     # Manual cleanup later
 ```
-
-Run `xc workspace` or `xc slot` for help.

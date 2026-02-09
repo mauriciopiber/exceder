@@ -1,24 +1,45 @@
+import { exec } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
 import { NextResponse } from "next/server";
-import { exec } from "child_process";
-import { promisify } from "util";
-import { readFile } from "fs/promises";
-import { homedir } from "os";
-import path from "path";
 
-const execAsync = promisify(exec);
+const execRaw = promisify(exec);
+
+// All shell commands get a 5s timeout to prevent hanging
+function execAsync(cmd: string, opts?: { timeout?: number }) {
+  return execRaw(cmd, { timeout: opts?.timeout ?? 5000 });
+}
 
 interface SlotRegistry {
   groups?: Record<string, { name: string; order: number }>;
   projects: Record<string, { base_port: number; path: string; group?: string }>;
-  slots: Record<string, { project: string; number: number; branch: string; created_at: string; tags?: string[] }>;
-  workspaces?: Record<string, { name: string; description: string; paths: string[]; created_at: string }>;
+  slots: Record<
+    string,
+    {
+      project: string;
+      number: number;
+      branch: string;
+      created_at: string;
+      tags?: string[];
+      locked?: boolean;
+      lock_note?: string;
+    }
+  >;
+  workspaces?: Record<
+    string,
+    { name: string; description: string; paths: string[]; created_at: string }
+  >;
   tags?: Record<string, { name: string; color: string }>;
 }
 
 interface DockerContainer {
   name: string;
-  port: number;
+  ports: { host: number; container: number }[];
   status: string;
+  image: string;
 }
 
 interface ClaudeUsage {
@@ -40,6 +61,20 @@ interface ClaudeInstance {
   usage: ClaudeUsage | null;
 }
 
+interface PortInfo {
+  port: number;
+  active: boolean;
+  owned: boolean; // true if process/container belongs to this project
+  process: string | null; // process name or docker container
+}
+
+interface StorybookInstance {
+  pid: number;
+  port: number;
+  cwd: string;
+  project: string; // extracted from cwd
+}
+
 interface Slot {
   name: string;
   project: string;
@@ -48,13 +83,15 @@ interface Slot {
   path: string;
   createdAt: string;
   ports: {
-    web: number;
-    postgres: number;
-    storybook: number | null;
+    web: PortInfo | null;
+    storybook: PortInfo | null;
   };
-  docker: DockerContainer | null;
+  containers: DockerContainer[]; // All matched containers
   claude: ClaudeInstance | null;
   tags: string[];
+  locked: boolean;
+  lockNote: string;
+  orphan: boolean;
 }
 
 interface ProjectGroup {
@@ -99,20 +136,26 @@ async function getRegistry(): Promise<SlotRegistry> {
 async function getDockerContainers(): Promise<DockerContainer[]> {
   try {
     const { stdout } = await execAsync(
-      'docker ps --format "{{.Names}}|{{.Ports}}|{{.Status}}"'
+      'docker ps --format "{{.Names}}|{{.Ports}}|{{.Status}}|{{.Image}}"',
     );
     return stdout
       .trim()
       .split("\n")
       .filter(Boolean)
       .map((line) => {
-        const [name, ports, status] = line.split("|");
-        const portMatch = ports.match(/0\.0\.0\.0:(\d+)/);
-        return {
-          name,
-          port: portMatch ? parseInt(portMatch[1]) : 0,
-          status,
-        };
+        const [name, portsStr, status, image] = line.split("|");
+
+        // Parse all port mappings: "0.0.0.0:5432->5432/tcp, 0.0.0.0:6379->6379/tcp"
+        const ports: { host: number; container: number }[] = [];
+        const portMatches = portsStr.matchAll(/0\.0\.0\.0:(\d+)->(\d+)/g);
+        for (const match of portMatches) {
+          ports.push({
+            host: parseInt(match[1], 10),
+            container: parseInt(match[2], 10),
+          });
+        }
+
+        return { name, ports, status, image };
       });
   } catch {
     return [];
@@ -121,26 +164,28 @@ async function getDockerContainers(): Promise<DockerContainer[]> {
 
 async function getClaudeInstances(): Promise<ClaudeInstance[]> {
   try {
-    const { stdout: pids } = await execAsync('pgrep -f "claude" 2>/dev/null || true');
+    const { stdout: pids } = await execAsync(
+      'pgrep -f "claude" 2>/dev/null || true',
+    );
     const instances: ClaudeInstance[] = [];
 
     for (const pid of pids.trim().split("\n").filter(Boolean)) {
       try {
         // Get working directory
         const { stdout: lsofOut } = await execAsync(
-          `lsof -p ${pid} 2>/dev/null | grep cwd | awk '{print $NF}'`
+          `lsof -p ${pid} 2>/dev/null | grep cwd | awk '{print $NF}'`,
         );
         const cwd = lsofOut.trim();
         if (!cwd || cwd === "/" || !cwd.startsWith("/Users")) continue;
 
         // Get branch
         const { stdout: branchOut } = await execAsync(
-          `git -C "${cwd}" branch --show-current 2>/dev/null || echo "unknown"`
+          `git -C "${cwd}" branch --show-current 2>/dev/null || echo "unknown"`,
         );
 
         // Get runtime
         const { stdout: runtimeOut } = await execAsync(
-          `ps -p ${pid} -o etime= 2>/dev/null || echo "unknown"`
+          `ps -p ${pid} -o etime= 2>/dev/null || echo "unknown"`,
         );
 
         // Try to get session info from claude projects dir
@@ -154,34 +199,41 @@ async function getClaudeInstances(): Promise<ClaudeInstance[]> {
 
         try {
           const { stdout: sessionFile } = await execAsync(
-            `ls -t "${sessionDir}"/*.jsonl 2>/dev/null | head -1`
+            `ls -t "${sessionDir}"/*.jsonl 2>/dev/null | head -1`,
           );
           if (sessionFile.trim()) {
             const { stdout: modelOut } = await execAsync(
-              `grep -o '"model":"[^"]*"' "${sessionFile.trim()}" 2>/dev/null | tail -1 | cut -d'"' -f4`
+              `grep -o '"model":"[^"]*"' "${sessionFile.trim()}" 2>/dev/null | tail -1 | cut -d'"' -f4`,
             );
             const { stdout: slugOut } = await execAsync(
-              `grep -o '"slug":"[^"]*"' "${sessionFile.trim()}" 2>/dev/null | tail -1 | cut -d'"' -f4`
+              `grep -o '"slug":"[^"]*"' "${sessionFile.trim()}" 2>/dev/null | tail -1 | cut -d'"' -f4`,
             );
-            model = modelOut.trim().replace("claude-", "").replace("-20251101", "") || "unknown";
+            model =
+              modelOut.trim().replace("claude-", "").replace("-20251101", "") ||
+              "unknown";
             session = slugOut.trim() || "unknown";
 
             // Get last assistant message and aggregate usage
             try {
               const { stdout: assistantLines } = await execAsync(
-                `grep '"type":"assistant"' "${sessionFile.trim()}" 2>/dev/null | tail -20`
+                `grep '"type":"assistant"' "${sessionFile.trim()}" 2>/dev/null | tail -20`,
               );
 
               let totalInput = 0;
               let totalOutput = 0;
               let totalCacheRead = 0;
 
-              for (const line of assistantLines.trim().split("\n").filter(Boolean)) {
+              for (const line of assistantLines
+                .trim()
+                .split("\n")
+                .filter(Boolean)) {
                 try {
                   const parsed = JSON.parse(line);
                   if (parsed.message?.usage) {
                     const u = parsed.message.usage;
-                    totalInput += (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+                    totalInput +=
+                      (u.input_tokens || 0) +
+                      (u.cache_creation_input_tokens || 0);
                     totalOutput += u.output_tokens || 0;
                     totalCacheRead += u.cache_read_input_tokens || 0;
                   }
@@ -191,7 +243,9 @@ async function getClaudeInstances(): Promise<ClaudeInstance[]> {
                     if (typeof content === "string") {
                       lastMessage = content.slice(0, 200);
                     } else if (Array.isArray(content)) {
-                      const textBlock = content.find((b: { type: string }) => b.type === "text");
+                      const textBlock = content.find(
+                        (b: { type: string }) => b.type === "text",
+                      );
                       if (textBlock?.text) {
                         lastMessage = textBlock.text.slice(0, 200);
                       }
@@ -210,9 +264,9 @@ async function getClaudeInstances(): Promise<ClaudeInstance[]> {
                 const cacheRate = inputRate * 0.1; // Cache reads are ~10% of input cost
 
                 const estimatedCost =
-                  (totalInput * inputRate / 1000) +
-                  (totalOutput * outputRate / 1000) +
-                  (totalCacheRead * cacheRate / 1000);
+                  (totalInput * inputRate) / 1000 +
+                  (totalOutput * outputRate) / 1000 +
+                  (totalCacheRead * cacheRate) / 1000;
 
                 usage = {
                   inputTokens: totalInput,
@@ -231,7 +285,7 @@ async function getClaudeInstances(): Promise<ClaudeInstance[]> {
         }
 
         instances.push({
-          pid: parseInt(pid),
+          pid: parseInt(pid, 10),
           cwd,
           branch: branchOut.trim(),
           runtime: runtimeOut.trim(),
@@ -245,13 +299,159 @@ async function getClaudeInstances(): Promise<ClaudeInstance[]> {
       }
     }
 
+    // Deduplicate by cwd (parent + child processes share same cwd)
+    const seen = new Set<string>();
+    const unique = instances.filter((inst) => {
+      if (seen.has(inst.cwd)) return false;
+      seen.add(inst.cwd);
+      return true;
+    });
+
+    return unique;
+  } catch {
+    return [];
+  }
+}
+
+async function getStorybookInstances(): Promise<StorybookInstance[]> {
+  try {
+    // Find storybook dispatcher processes (the main running storybook)
+    const { stdout } = await execAsync(
+      `ps aux | grep "storybook/dist/bin/dispatcher.js" | grep -v grep`,
+    );
+
+    const instances: StorybookInstance[] = [];
+
+    for (const line of stdout.trim().split("\n").filter(Boolean)) {
+      try {
+        // Parse: user PID ... node /path/to/storybook/dist/bin/dispatcher.js dev -p PORT
+        const parts = line.split(/\s+/);
+        const pid = parseInt(parts[1], 10);
+
+        // Extract port from -p argument
+        const pIndex = parts.indexOf("-p");
+        const port =
+          pIndex >= 0 && parts[pIndex + 1]
+            ? parseInt(parts[pIndex + 1], 10)
+            : 6006;
+
+        // Extract project path from the command
+        const pathMatch = line.match(
+          /\/Users\/[^/]+\/Projects\/[^/]+\/([^/]+)/,
+        );
+        const project = pathMatch ? pathMatch[1] : "unknown";
+
+        // Get full cwd
+        const cwdMatch = line.match(/(\/Users\/[^\s]+\/node_modules)/);
+        const cwd = cwdMatch
+          ? cwdMatch[1].replace("/node_modules", "").replace("/apps/web", "")
+          : "";
+
+        instances.push({ pid, port, cwd, project });
+      } catch {
+        // Skip malformed lines
+      }
+    }
+
     return instances;
   } catch {
     return [];
   }
 }
 
-async function getStorybookPort(slotPath: string): Promise<number | null> {
+// Single lsof call to get ALL listening ports at once
+async function getAllListeningPorts(): Promise<Map<number, string>> {
+  const portMap = new Map<number, string>();
+  try {
+    const { stdout } = await execAsync(
+      `lsof -iTCP -sTCP:LISTEN -n -P 2>/dev/null | awk '{print $1, $9}'`,
+    );
+    for (const line of stdout.trim().split("\n").filter(Boolean)) {
+      const parts = line.split(/\s+/);
+      if (parts.length < 2) continue;
+      const processName = parts[0];
+      const portMatch = parts[1].match(/:(\d+)$/);
+      if (portMatch) {
+        const port = parseInt(portMatch[1], 10);
+        if (!portMap.has(port)) {
+          portMap.set(port, processName);
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return portMap;
+}
+
+function getPortInfo(
+  port: number | null,
+  slotName: string | undefined,
+  listeningPorts: Map<number, string>,
+  containers: DockerContainer[],
+): PortInfo | null {
+  if (port === null || port === 0) return null;
+
+  const processName = listeningPorts.get(port);
+  if (!processName) {
+    return { port, active: false, owned: false, process: null };
+  }
+
+  // Resolve docker process to container name
+  let resolvedProcess = processName;
+  if (
+    processName === "OrbStack" ||
+    processName === "com.docke" ||
+    processName === "docker"
+  ) {
+    const container = containers.find((c) =>
+      c.ports.some((p) => p.host === port),
+    );
+    resolvedProcess = container ? container.name : "docker";
+  }
+
+  // Check ownership
+  let owned = false;
+  if (slotName) {
+    const normalizedSlot = slotName.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const normalizedProcess = resolvedProcess
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
+    owned =
+      normalizedProcess.includes(normalizedSlot) ||
+      normalizedSlot.includes(normalizedProcess) ||
+      resolvedProcess.toLowerCase().startsWith(slotName.toLowerCase());
+  }
+
+  return { port, active: true, owned, process: resolvedProcess };
+}
+
+async function getEnvPort(
+  slotPath: string,
+  varName: string,
+): Promise<number | null> {
+  const envFiles = [".env.local", ".env"];
+  const subdirs = ["", "apps/web", "apps/api", "packages/ui"];
+
+  for (const subdir of subdirs) {
+    for (const envFile of envFiles) {
+      try {
+        const envPath = path.join(slotPath, subdir, envFile);
+        const content = await readFile(envPath, "utf-8");
+        const regex = new RegExp(`${varName}=["']?(\\d+)["']?`);
+        const match = content.match(regex);
+        if (match) {
+          return parseInt(match[1], 10);
+        }
+      } catch {
+        // File doesn't exist, continue
+      }
+    }
+  }
+  return null;
+}
+
+async function _getStorybookPort(slotPath: string): Promise<number | null> {
   try {
     // Try to read STORYBOOK_PORT from .env files
     for (const envFile of [".env.local", ".env"]) {
@@ -260,7 +460,7 @@ async function getStorybookPort(slotPath: string): Promise<number | null> {
         const content = await readFile(envPath, "utf-8");
         const match = content.match(/STORYBOOK_PORT=["']?(\d+)["']?/);
         if (match) {
-          return parseInt(match[1]);
+          return parseInt(match[1], 10);
         }
       } catch {
         // File doesn't exist, continue
@@ -274,7 +474,7 @@ async function getStorybookPort(slotPath: string): Promise<number | null> {
           const content = await readFile(envPath, "utf-8");
           const match = content.match(/STORYBOOK_PORT=["']?(\d+)["']?/);
           if (match) {
-            return parseInt(match[1]);
+            return parseInt(match[1], 10);
           }
         } catch {
           // File doesn't exist, continue
@@ -290,7 +490,7 @@ async function getStorybookPort(slotPath: string): Promise<number | null> {
 async function getBranchForPath(dirPath: string): Promise<string> {
   try {
     const { stdout } = await execAsync(
-      `git -C "${dirPath}" branch --show-current 2>/dev/null || echo "unknown"`
+      `git -C "${dirPath}" branch --show-current 2>/dev/null || echo "unknown"`,
     );
     return stdout.trim();
   } catch {
@@ -299,24 +499,66 @@ async function getBranchForPath(dirPath: string): Promise<string> {
 }
 
 export async function GET() {
-  const [registry, containers, claudes] = await Promise.all([
-    getRegistry(),
-    getDockerContainers(),
-    getClaudeInstances(),
-  ]);
+  try {
+    return await Promise.race([
+      handleGET(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("API timeout")), 15000),
+      ),
+    ]);
+  } catch (err) {
+    console.error("API error:", err);
+    return NextResponse.json(
+      { error: "Request timed out or failed" },
+      { status: 500 },
+    );
+  }
+}
+
+async function handleGET() {
+  const [registry, containers, claudes, storybooks, listeningPorts] =
+    await Promise.all([
+      getRegistry(),
+      getDockerContainers(),
+      getClaudeInstances(),
+      getStorybookInstances(),
+      getAllListeningPorts(),
+    ]);
 
   // Build slots with docker and claude info
   const slotsWithStorybook = await Promise.all(
     Object.entries(registry.slots).map(async ([name, slot]) => {
       const project = registry.projects[slot.project];
-      const basePort = project?.base_port || 3000;
-      const projectOffset = Math.floor((basePort - 3000) / 10);
 
       const slotPath = project?.path
         ? path.join(path.dirname(project.path), name)
         : "";
 
-      const storybookPort = slotPath ? await getStorybookPort(slotPath) : null;
+      // Check if directory exists on disk
+      const orphan = !slotPath || !existsSync(slotPath);
+
+      // Read ports from .env files
+      const [webPort, storybookPort] =
+        slotPath && !orphan
+          ? await Promise.all([
+              getEnvPort(slotPath, "PORT"),
+              getEnvPort(slotPath, "STORYBOOK_PORT"),
+            ])
+          : [null, null];
+
+      // Check port status (sync lookup from cached lsof)
+      const webInfo = getPortInfo(webPort, name, listeningPorts, containers);
+      const storybookInfo = getPortInfo(
+        storybookPort,
+        name,
+        listeningPorts,
+        containers,
+      );
+
+      // Match all containers that start with slot name
+      const matchedContainers = containers.filter(
+        (c) => c.name.startsWith(name) || c.name.startsWith(`${name}-`),
+      );
 
       return {
         name,
@@ -326,18 +568,23 @@ export async function GET() {
         path: slotPath,
         createdAt: slot.created_at,
         ports: {
-          web: basePort + slot.number,
-          postgres: 5432 + projectOffset + slot.number,
-          storybook: storybookPort,
+          web: webInfo,
+          storybook: storybookInfo,
         },
-        docker: containers.find((c) => c.name === `${name}-db`) || null,
+        containers: matchedContainers,
         // Match claude by exact path OR subdirectories within the slot
-        claude: claudes.find((c) =>
-          slotPath && (c.cwd === slotPath || c.cwd.startsWith(slotPath + "/"))
-        ) || null,
+        claude:
+          claudes.find(
+            (c) =>
+              slotPath &&
+              (c.cwd === slotPath || c.cwd.startsWith(`${slotPath}/`)),
+          ) || null,
         tags: slot.tags || [],
+        locked: slot.locked || false,
+        lockNote: slot.lock_note || "",
+        orphan,
       };
-    })
+    }),
   );
   const slots: Slot[] = slotsWithStorybook;
 
@@ -345,7 +592,31 @@ export async function GET() {
   const mainSlotsWithStorybook = await Promise.all(
     Object.entries(registry.projects).map(async ([name, project]) => {
       const mainPath = project.path;
-      const storybookPort = mainPath ? await getStorybookPort(mainPath) : null;
+
+      // Read ports from .env files
+      const [webPort, storybookPort] = mainPath
+        ? await Promise.all([
+            getEnvPort(mainPath, "PORT"),
+            getEnvPort(mainPath, "STORYBOOK_PORT"),
+          ])
+        : [null, null];
+
+      // Check port status (sync lookup from cached lsof)
+      const webInfo = getPortInfo(webPort, name, listeningPorts, containers);
+      const storybookInfo = getPortInfo(
+        storybookPort,
+        name,
+        listeningPorts,
+        containers,
+      );
+
+      // Match containers that start with project name (but not slot names like project-1)
+      const matchedContainers = containers.filter(
+        (c) =>
+          (c.name.startsWith(name) || c.name.startsWith(`${name}-`)) &&
+          !c.name.match(new RegExp(`^${name}-\\d`)), // Exclude slot containers like project-1-db
+      );
+
       return {
         name: name,
         project: name,
@@ -354,17 +625,22 @@ export async function GET() {
         path: mainPath,
         createdAt: "",
         ports: {
-          web: project.base_port,
-          postgres: 5432 + Math.floor((project.base_port - 3000) / 10),
-          storybook: storybookPort,
+          web: webInfo,
+          storybook: storybookInfo,
         },
-        docker: containers.find((c) => c.name === `${name}-db`) || null,
-        claude: claudes.find((c) =>
-          mainPath && (c.cwd === mainPath || c.cwd.startsWith(mainPath + "/"))
-        ) || null,
+        containers: matchedContainers,
+        claude:
+          claudes.find(
+            (c) =>
+              mainPath &&
+              (c.cwd === mainPath || c.cwd.startsWith(`${mainPath}/`)),
+          ) || null,
         tags: [],
+        locked: false,
+        lockNote: "",
+        orphan: false,
       };
-    })
+    }),
   );
   const mainSlots: Slot[] = mainSlotsWithStorybook;
 
@@ -379,13 +655,11 @@ export async function GET() {
         basePort: project.base_port,
         slots: mainSlot ? [mainSlot, ...numberedSlots] : numberedSlots,
       };
-    }
+    },
   );
 
   // Add orphan slots (project not registered)
-  const orphanSlots = slots.filter(
-    (s) => !registry.projects[s.project]
-  );
+  const orphanSlots = slots.filter((s) => !registry.projects[s.project]);
   if (orphanSlots.length > 0) {
     projectGroups.push({
       name: "Other",
@@ -400,7 +674,7 @@ export async function GET() {
   const groups: Group[] = Object.entries(registryGroups)
     .map(([id, group]) => {
       const groupProjects = projectGroups.filter(
-        (pg) => registry.projects[pg.name]?.group === id
+        (pg) => registry.projects[pg.name]?.group === id,
       );
       return {
         id,
@@ -413,7 +687,7 @@ export async function GET() {
 
   // Add ungrouped projects to "Other" group
   const ungroupedProjects = projectGroups.filter(
-    (pg) => !registry.projects[pg.name]?.group
+    (pg) => !registry.projects[pg.name]?.group,
   );
   if (ungroupedProjects.length > 0) {
     groups.push({
@@ -434,12 +708,12 @@ export async function GET() {
 
           // Match ALL claudes by path (exact or starts with for subdirs)
           const matchedClaudes = claudes.filter(
-            (c) => c.cwd === wsPath || c.cwd.startsWith(wsPath + "/")
+            (c) => c.cwd === wsPath || c.cwd.startsWith(`${wsPath}/`),
           );
 
           // Match ALL docker containers by directory name pattern
           const matchedDockers = containers.filter(
-            (c) => c.name.includes(dirName) || c.name.startsWith(dirName)
+            (c) => c.name.includes(dirName) || c.name.startsWith(dirName),
           );
 
           return {
@@ -449,7 +723,7 @@ export async function GET() {
             claudes: matchedClaudes,
             dockers: matchedDockers,
           };
-        })
+        }),
       );
 
       return {
@@ -458,7 +732,7 @@ export async function GET() {
         members,
         createdAt: ws.created_at,
       };
-    })
+    }),
   );
 
   // Track which claudes are matched to workspaces
@@ -468,12 +742,12 @@ export async function GET() {
 
   // Find unregistered claude instances (not matched to any slot, main, or workspace)
   const matchedClaudeCwds = [
-    ...slots.filter((s) => s.claude !== null).map((s) => s.claude!.cwd),
-    ...mainSlots.filter((s) => s.claude !== null).map((s) => s.claude!.cwd),
+    ...slots.filter((s) => s.claude !== null).map((s) => s.claude?.cwd),
+    ...mainSlots.filter((s) => s.claude !== null).map((s) => s.claude?.cwd),
     ...workspaceClaudeCwds,
   ];
   const unregisteredClaudes = claudes.filter(
-    (c) => !matchedClaudeCwds.includes(c.cwd)
+    (c) => !matchedClaudeCwds.includes(c.cwd),
   );
 
   // Track which containers are matched to workspaces
@@ -483,12 +757,30 @@ export async function GET() {
 
   // Find orphan docker containers (not matched to any slot or workspace)
   const matchedContainerNames = [
-    ...slots.filter((s) => s.docker !== null).map((s) => s.docker!.name),
+    ...slots.flatMap((s) => s.containers.map((c) => c.name)),
+    ...mainSlots.flatMap((s) => s.containers.map((c) => c.name)),
     ...workspaceContainerNames,
   ];
   const orphanContainers = containers.filter(
-    (c) => !matchedContainerNames.includes(c.name)
+    (c) => !matchedContainerNames.includes(c.name),
   );
+
+  // Find orphan storybook instances (port doesn't match any slot's configured storybook port)
+  const allSlotStorybookPorts = [
+    ...slots
+      .filter((s) => s.ports.storybook?.port)
+      .map((s) => s.ports.storybook?.port),
+    ...mainSlots
+      .filter((s) => s.ports.storybook?.port)
+      .map((s) => s.ports.storybook?.port),
+  ];
+  const orphanStorybooks = storybooks.filter(
+    (sb) => !allSlotStorybookPorts.includes(sb.port),
+  );
+
+  // Count active web servers across all slots
+  const allSlots = [...slots, ...mainSlots];
+  const activeWebServers = allSlots.filter((s) => s.ports.web?.active).length;
 
   return NextResponse.json({
     groups,
@@ -496,6 +788,8 @@ export async function GET() {
     workspaces,
     unregisteredClaudes,
     orphanContainers,
+    orphanStorybooks,
+    allStorybooks: storybooks,
     tags: registry.tags || {},
     summary: {
       totalSlots: slots.length,
@@ -503,8 +797,11 @@ export async function GET() {
       totalGroups: groups.length,
       runningClaudes: claudes.length,
       runningContainers: containers.length,
+      runningStorybooks: storybooks.length,
+      activeWebServers,
       orphanClaudes: unregisteredClaudes.length,
       orphanContainers: orphanContainers.length,
+      orphanStorybooks: orphanStorybooks.length,
     },
   });
 }

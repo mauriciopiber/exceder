@@ -1,7 +1,7 @@
-import { NextRequest } from "next/server";
-import { watch, readFile } from "fs";
-import { homedir } from "os";
-import path from "path";
+import { readFile, watch } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
+import type { NextRequest } from "next/server";
 import { parseClaudeJSONL } from "@/lib/claude-jsonl";
 
 // GET /api/claude-session/stream?project=/path&session=uuid
@@ -11,7 +11,9 @@ export async function GET(req: NextRequest) {
   const sessionId = url.searchParams.get("session");
 
   if (!projectPath || !sessionId) {
-    return new Response("Missing project or session parameter", { status: 400 });
+    return new Response("Missing project or session parameter", {
+      status: 400,
+    });
   }
 
   const projectKey = projectPath.replace(/\//g, "-");
@@ -19,7 +21,7 @@ export async function GET(req: NextRequest) {
     homedir(),
     ".claude/projects",
     projectKey,
-    `${sessionId}.jsonl`
+    `${sessionId}.jsonl`,
   );
 
   // Track last known line count to only send new messages
@@ -45,21 +47,21 @@ export async function GET(req: NextRequest) {
           // Only send if we have new messages
           if (lines.length > lastLineCount) {
             const newMessages = messages.slice(
-              lastLineCount > 0 ? Math.floor(lastLineCount / 2) : 0
+              lastLineCount > 0 ? Math.floor(lastLineCount / 2) : 0,
             );
             lastLineCount = lines.length;
 
             controller.enqueue(
               encoder.encode(
-                `data: ${JSON.stringify({ type: "messages", messages: newMessages })}\n\n`
-              )
+                `data: ${JSON.stringify({ type: "messages", messages: newMessages })}\n\n`,
+              ),
             );
           }
         } catch (error) {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ type: "error", error: String(error) })}\n\n`
-            )
+              `data: ${JSON.stringify({ type: "error", error: String(error) })}\n\n`,
+            ),
           );
         }
       };

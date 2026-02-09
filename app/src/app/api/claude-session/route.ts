@@ -1,7 +1,7 @@
+import { readdir, readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
 import { NextResponse } from "next/server";
-import { readFile, readdir, stat } from "fs/promises";
-import { homedir } from "os";
-import path from "path";
 import { parseClaudeJSONL } from "@/lib/claude-jsonl";
 
 interface SessionInfo {
@@ -22,7 +22,7 @@ export async function GET(req: Request) {
   if (!projectPath) {
     return NextResponse.json(
       { error: "Missing project parameter" },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
@@ -67,7 +67,7 @@ export async function GET(req: Request) {
     // Sort by last modified, newest first
     sessions.sort(
       (a, b) =>
-        new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime()
+        new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime(),
     );
 
     return NextResponse.json({ sessions });
@@ -77,7 +77,7 @@ export async function GET(req: Request) {
     }
     return NextResponse.json(
       { error: "Failed to read sessions" },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

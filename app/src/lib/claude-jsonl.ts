@@ -31,7 +31,13 @@ interface ClaudeMessage {
 }
 
 interface ClaudeJSONLEntry {
-  type: "user" | "assistant" | "system" | "summary" | "file-history-snapshot" | "queue-operation";
+  type:
+    | "user"
+    | "assistant"
+    | "system"
+    | "summary"
+    | "file-history-snapshot"
+    | "queue-operation";
   message?: ClaudeMessage;
   uuid?: string;
   timestamp?: string;
@@ -42,11 +48,12 @@ interface ClaudeJSONLEntry {
 
 // Conversion Functions
 
-export function convertClaudeToThreadMessage(entry: ClaudeJSONLEntry): ThreadMessageLike | null {
+export function convertClaudeToThreadMessage(
+  entry: ClaudeJSONLEntry,
+): ThreadMessageLike | null {
   if (entry.type === "user" && entry.message) {
-    const content = typeof entry.message.content === "string"
-      ? entry.message.content
-      : "";
+    const content =
+      typeof entry.message.content === "string" ? entry.message.content : "";
 
     return {
       role: "user",
@@ -61,7 +68,15 @@ export function convertClaudeToThreadMessage(entry: ClaudeJSONLEntry): ThreadMes
       ? entry.message.content
       : [];
 
-    const content: ThreadMessageLike["content"] = [];
+    const content: (
+      | { type: "text"; text: string }
+      | {
+          type: "tool-call";
+          toolCallId: string;
+          toolName: string;
+          args: Record<string, unknown>;
+        }
+    )[] = [];
 
     for (const block of contentBlocks) {
       if (block.type === "text" && block.text) {
@@ -88,7 +103,7 @@ export function convertClaudeToThreadMessage(entry: ClaudeJSONLEntry): ThreadMes
 
     return {
       role: "assistant",
-      content,
+      content: content as ThreadMessageLike["content"],
       id: entry.uuid,
       createdAt: entry.timestamp ? new Date(entry.timestamp) : undefined,
     };
@@ -126,7 +141,9 @@ export interface ClaudeSession {
   messageCount?: number;
 }
 
-export async function getClaudeSessions(projectPath: string): Promise<ClaudeSession[]> {
+export async function getClaudeSessions(
+  projectPath: string,
+): Promise<ClaudeSession[]> {
   // This would be called from an API route, not client-side
   // Returns list of available sessions for a project
   const projectKey = projectPath.replace(/\//g, "-");

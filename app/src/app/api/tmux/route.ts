@@ -1,6 +1,6 @@
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
 import { NextResponse } from "next/server";
-import { exec } from "child_process";
-import { promisify } from "util";
 
 const execAsync = promisify(exec);
 
@@ -22,7 +22,7 @@ export interface TtydProcess {
 async function getTmuxSessions(): Promise<TmuxSession[]> {
   try {
     const { stdout } = await execAsync(
-      'tmux list-sessions -F "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}" 2>/dev/null'
+      'tmux list-sessions -F "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}" 2>/dev/null',
     );
 
     // Get ttyd processes to match with sessions
@@ -34,14 +34,14 @@ async function getTmuxSessions(): Promise<TmuxSession[]> {
       .filter(Boolean)
       .map((line) => {
         const [name, windows, created, attached, activity] = line.split("|");
-        const ttyd = ttydProcesses.find(t => t.session === name);
+        const ttyd = ttydProcesses.find((t) => t.session === name);
 
         return {
           name,
-          windows: parseInt(windows) || 1,
-          created: new Date(parseInt(created) * 1000).toISOString(),
+          windows: parseInt(windows, 10) || 1,
+          created: new Date(parseInt(created, 10) * 1000).toISOString(),
           attached: attached === "1",
-          lastActivity: new Date(parseInt(activity) * 1000).toISOString(),
+          lastActivity: new Date(parseInt(activity, 10) * 1000).toISOString(),
           ttydPort: ttyd?.port || null,
         };
       });
@@ -53,21 +53,21 @@ async function getTmuxSessions(): Promise<TmuxSession[]> {
 async function getTtydProcesses(): Promise<TtydProcess[]> {
   try {
     // Find ttyd processes and extract their port and session
-    const { stdout } = await execAsync(
-      'ps aux | grep "[t]tyd" | grep -v grep'
-    );
+    const { stdout } = await execAsync('ps aux | grep "[t]tyd" | grep -v grep');
 
     const processes: TtydProcess[] = [];
 
     for (const line of stdout.trim().split("\n").filter(Boolean)) {
       const pidMatch = line.match(/^\S+\s+(\d+)/);
       const portMatch = line.match(/-p\s+(\d+)/);
-      const sessionMatch = line.match(/tmux\s+(?:new\s+-A\s+-s|attach\s+-t)\s+(\S+)/);
+      const sessionMatch = line.match(
+        /tmux\s+(?:new\s+-A\s+-s|attach\s+-t)\s+(\S+)/,
+      );
 
       if (pidMatch && portMatch) {
         processes.push({
-          pid: parseInt(pidMatch[1]),
-          port: parseInt(portMatch[1]),
+          pid: parseInt(pidMatch[1], 10),
+          port: parseInt(portMatch[1], 10),
           session: sessionMatch?.[1] || "unknown",
         });
       }
@@ -86,8 +86,8 @@ export async function GET() {
     sessions,
     summary: {
       total: sessions.length,
-      attached: sessions.filter(s => s.attached).length,
-      withTtyd: sessions.filter(s => s.ttydPort !== null).length,
+      attached: sessions.filter((s) => s.attached).length,
+      withTtyd: sessions.filter((s) => s.ttydPort !== null).length,
     },
   });
 }
@@ -104,13 +104,13 @@ export async function POST(req: Request) {
         const workDir = cwd || process.cwd();
 
         await execAsync(
-          `tmux new-session -d -s "${sessionName}" -c "${workDir}"`
+          `tmux new-session -d -s "${sessionName}" -c "${workDir}"`,
         );
 
         return NextResponse.json({
           success: true,
           session: sessionName,
-          message: `Session "${sessionName}" created`
+          message: `Session "${sessionName}" created`,
         });
       }
 
@@ -122,19 +122,19 @@ export async function POST(req: Request) {
 
         // Create tmux session
         await execAsync(
-          `tmux new-session -d -s "${sessionName}" -c "${workDir}"`
+          `tmux new-session -d -s "${sessionName}" -c "${workDir}"`,
         );
 
         // Start ttyd pointing to the session
         await execAsync(
-          `ttyd -W -p ${ttydPort} tmux attach -t "${sessionName}" &`
+          `ttyd -W -p ${ttydPort} tmux attach -t "${sessionName}" &`,
         );
 
         return NextResponse.json({
           success: true,
           session: sessionName,
           ttydPort,
-          message: `Session "${sessionName}" created with ttyd on port ${ttydPort}`
+          message: `Session "${sessionName}" created with ttyd on port ${ttydPort}`,
         });
       }
 
@@ -143,37 +143,37 @@ export async function POST(req: Request) {
         const ttydPort = port || 7681;
 
         // Kill existing ttyd on this port if any
-        await execAsync(`lsof -ti:${ttydPort} | xargs kill -9 2>/dev/null || true`);
+        await execAsync(
+          `lsof -ti:${ttydPort} | xargs kill -9 2>/dev/null || true`,
+        );
 
         // Start ttyd
-        await execAsync(
-          `ttyd -W -p ${ttydPort} tmux attach -t "${name}" &`
-        );
+        await execAsync(`ttyd -W -p ${ttydPort} tmux attach -t "${name}" &`);
 
         return NextResponse.json({
           success: true,
           session: name,
           ttydPort,
-          message: `ttyd started on port ${ttydPort} for session "${name}"`
+          message: `ttyd started on port ${ttydPort} for session "${name}"`,
         });
       }
 
       case "stop-ttyd": {
         // Stop ttyd for a session
         const ttydProcesses = await getTtydProcesses();
-        const ttyd = ttydProcesses.find(t => t.session === name);
+        const ttyd = ttydProcesses.find((t) => t.session === name);
 
         if (ttyd) {
           await execAsync(`kill ${ttyd.pid}`);
           return NextResponse.json({
             success: true,
-            message: `ttyd stopped for session "${name}"`
+            message: `ttyd stopped for session "${name}"`,
           });
         }
 
         return NextResponse.json({
           success: false,
-          message: `No ttyd found for session "${name}"`
+          message: `No ttyd found for session "${name}"`,
         });
       }
 
@@ -183,7 +183,7 @@ export async function POST(req: Request) {
 
         return NextResponse.json({
           success: true,
-          message: `Session "${name}" killed`
+          message: `Session "${name}" killed`,
         });
       }
 
@@ -192,29 +192,27 @@ export async function POST(req: Request) {
         const { keys, enter = true } = body;
         const enterKey = enter ? " Enter" : "";
 
-        await execAsync(
-          `tmux send-keys -t "${name}" "${keys}"${enterKey}`
-        );
+        await execAsync(`tmux send-keys -t "${name}" "${keys}"${enterKey}`);
 
         return NextResponse.json({
           success: true,
-          message: `Keys sent to session "${name}"`
+          message: `Keys sent to session "${name}"`,
         });
       }
 
       default:
         return NextResponse.json(
           { success: false, message: `Unknown action: ${action}` },
-          { status: 400 }
+          { status: 400 },
         );
     }
   } catch (error) {
     return NextResponse.json(
       {
         success: false,
-        message: error instanceof Error ? error.message : "Unknown error"
+        message: error instanceof Error ? error.message : "Unknown error",
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

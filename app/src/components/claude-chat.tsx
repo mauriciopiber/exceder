@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 // Simple message type for our POC
 interface SimpleMessage {
@@ -17,16 +17,23 @@ interface ClaudeChatProps {
   onClose?: () => void;
 }
 
+interface APIMessage {
+  id?: string;
+  role: "user" | "assistant";
+  content: string | { type: string; text?: string }[];
+  createdAt?: string;
+}
+
 // Helper to convert API messages to SimpleMessage format
-function convertMessages(apiMessages: any[]): SimpleMessage[] {
-  return apiMessages.map((msg: any) => {
+function convertMessages(apiMessages: APIMessage[]): SimpleMessage[] {
+  return apiMessages.map((msg) => {
     let text = "";
     if (typeof msg.content === "string") {
       text = msg.content;
     } else if (Array.isArray(msg.content)) {
       text = msg.content
-        .filter((part: any) => part.type === "text")
-        .map((part: any) => part.text)
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
         .join("\n");
     }
     return {
@@ -54,7 +61,7 @@ function ClaudeChatInner({
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, []);
 
   // Connect to SSE stream for real-time updates
   useEffect(() => {
@@ -149,13 +156,12 @@ function ClaudeChatInner({
           <h3 className="font-medium">Claude Session</h3>
           <p className="text-xs text-muted-foreground font-mono">
             {sessionId.slice(0, 8)}...
-            {isStreaming && (
-              <span className="ml-2 text-green-500">LIVE</span>
-            )}
+            {isStreaming && <span className="ml-2 text-green-500">LIVE</span>}
           </p>
         </div>
         {onClose && (
           <button
+            type="button"
             onClick={onClose}
             className="text-sm px-2 py-1 rounded hover:bg-muted"
           >
@@ -205,11 +211,14 @@ function ClaudeChatInner({
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSend()}
-            placeholder={tmuxSession ? "Send a message..." : "Select tmux session first"}
+            placeholder={
+              tmuxSession ? "Send a message..." : "Select tmux session first"
+            }
             disabled={!tmuxSession}
             className="flex-1 px-3 py-2 border rounded-md bg-background disabled:opacity-50"
           />
           <button
+            type="button"
             onClick={handleSend}
             disabled={!tmuxSession}
             className="px-4 py-2 bg-primary text-primary-foreground rounded-md font-medium disabled:opacity-50"
@@ -228,8 +237,8 @@ export function ClaudeChat(props: ClaudeChatProps) {
 
 // Simple standalone version for testing
 export function ClaudeChatStandalone() {
-  const [projectPath, setProjectPath] = useState(
-    "/Users/mauriciopiber/Projects/piber/realcraft"
+  const [projectPath, _setProjectPath] = useState(
+    "/Users/mauriciopiber/Projects/piber/realcraft",
   );
   const [sessionId, setSessionId] = useState("");
   const [tmuxSession, setTmuxSession] = useState("");
@@ -252,7 +261,9 @@ export function ClaudeChatStandalone() {
       .then((r) => r.json())
       .then((data) => {
         // Extract session names from the response
-        const names = (data.sessions || []).map((s: { name: string }) => s.name);
+        const names = (data.sessions || []).map(
+          (s: { name: string }) => s.name,
+        );
         setTmuxSessions(names);
       })
       .catch(console.error);
@@ -265,10 +276,14 @@ export function ClaudeChatStandalone() {
 
         {/* Tmux session selector */}
         <div className="space-y-2">
-          <label className="text-sm text-muted-foreground">
+          <label
+            htmlFor="tmux-session-select"
+            className="text-sm text-muted-foreground"
+          >
             Tmux Session (for sending messages):
           </label>
           <select
+            id="tmux-session-select"
             value={tmuxSession}
             onChange={(e) => setTmuxSession(e.target.value)}
             className="w-full p-2 border rounded bg-background"
@@ -284,11 +299,12 @@ export function ClaudeChatStandalone() {
 
         {/* Session list */}
         <div className="space-y-2">
-          <label className="text-sm text-muted-foreground">
+          <span className="text-sm text-muted-foreground">
             Claude Code Sessions:
-          </label>
+          </span>
           {sessions.map((s) => (
             <button
+              type="button"
               key={s.id}
               onClick={() => setSessionId(s.id)}
               className="w-full text-left p-3 border rounded hover:bg-muted"
