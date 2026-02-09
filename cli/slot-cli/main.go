@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -62,6 +61,10 @@ func main() {
 		cmdDBSync()
 	case "merge":
 		cmdMerge(args)
+	case "verify":
+		cmdVerify()
+	case "fix-ports":
+		cmdFixPorts()
 	default:
 		printUsage()
 	}
@@ -77,6 +80,8 @@ Commands:
   start             Start Claude in current directory
   continue          Continue Claude session
   check [N]         Validate slot configuration
+  verify            Verify slot matches parent worktree (1:1)
+  fix-ports         Fix slot ports to match parent + slot number
   sync              Rebase slot branch on main (pull latest changes)
   db-sync           Clone database from main to current slot
   merge <N>         Merge slot branch into main (run from main)
@@ -134,6 +139,7 @@ func cmdNew(args []string) {
 	portMap := scanAndAllocatePorts(mainRepo, slotNum)
 	if len(portMap) > 0 {
 		updateSlotEnvFiles(slotPath, portMap, slotName)
+		updateConfigFiles(slotPath, portMap)
 		updateDockerComposeFiles(slotPath, slotName)
 		fmt.Println("✓ Port mapping complete")
 
@@ -400,6 +406,9 @@ func cmdSync() {
 	}
 
 	fmt.Println("\n✓ Successfully synced with main")
+
+	// Install dependencies after rebase
+	installDeps(cwd)
 }
 
 func cmdMerge(args []string) {
@@ -453,6 +462,327 @@ func cmdMerge(args []string) {
 	}
 
 	fmt.Printf("\n✓ Merged %s into main\n", branchName)
+}
+
+func cmdVerify() {
+	cwd, _ := os.Getwd()
+	mainRepo, project := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// Must be run from slot (worktree)
+	if mainRepo == cwd {
+		fmt.Println("Error: must run from a slot worktree, not main")
+		os.Exit(1)
+	}
+
+	slotPath := cwd
+
+	// Extract slot number from directory name
+	base := filepath.Base(slotPath)
+	re := regexp.MustCompile(`-(\d+)$`)
+	m := re.FindStringSubmatch(base)
+	if len(m) < 2 {
+		fmt.Println("Error: could not detect slot number from directory name")
+		os.Exit(1)
+	}
+	slotNum, _ := strconv.Atoi(m[1])
+	slotName := fmt.Sprintf("%s-%d", project, slotNum)
+
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Printf("  SLOT VERIFICATION: %s\n", slotName)
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	errors := 0
+	warnings := 0
+
+	// 1. Check worktree linkage
+	fmt.Println("┌─ Worktree Linkage")
+	gitFile := filepath.Join(slotPath, ".git")
+	if info, err := os.Stat(gitFile); err == nil && !info.IsDir() {
+		content, _ := os.ReadFile(gitFile)
+		line := strings.TrimSpace(string(content))
+		if strings.HasPrefix(line, "gitdir:") {
+			gitdir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+			if strings.Contains(gitdir, mainRepo) {
+				fmt.Printf("│  ✓ Linked to main: %s\n", mainRepo)
+			} else {
+				fmt.Printf("│  ✗ Linked to unexpected repo: %s\n", gitdir)
+				errors++
+			}
+		}
+	} else {
+		fmt.Println("│  ✗ Not a valid worktree (.git file missing)")
+		errors++
+	}
+	fmt.Println("└──────────────────────────────────────")
+	fmt.Println()
+
+	// 2. Check branch relationship
+	fmt.Println("┌─ Branch & History")
+	slotBranch := getBranchName(slotPath)
+	mainBranch := getBranchName(mainRepo)
+	fmt.Printf("│  Slot branch:  %s\n", slotBranch)
+	fmt.Printf("│  Main branch:  %s\n", mainBranch)
+
+	// Check if branches share history (merge base exists)
+	mergeBase, err := exec.Command("git", "-C", slotPath, "merge-base", slotBranch, mainBranch).Output()
+	if err != nil || len(mergeBase) == 0 {
+		fmt.Println("│  ✗ No common ancestor with main")
+		errors++
+	} else {
+		fmt.Printf("│  ✓ Common ancestor: %s\n", strings.TrimSpace(string(mergeBase))[:7])
+
+		// Check commits ahead/behind
+		behindOut, _ := exec.Command("git", "-C", slotPath, "rev-list", "--count", slotBranch+".."+mainBranch).Output()
+		aheadOut, _ := exec.Command("git", "-C", slotPath, "rev-list", "--count", mainBranch+".."+slotBranch).Output()
+		behind := strings.TrimSpace(string(behindOut))
+		ahead := strings.TrimSpace(string(aheadOut))
+		fmt.Printf("│  ✓ %s ahead, %s behind main\n", ahead, behind)
+
+		if behind != "0" {
+			fmt.Println("│  ⚠ Consider running 'slot-cli sync' to update")
+			warnings++
+		}
+	}
+	fmt.Println("└──────────────────────────────────────")
+	fmt.Println()
+
+	// 3. Check registry
+	fmt.Println("┌─ Registry")
+	reg := loadRegistry()
+	if slot, exists := reg.Slots[slotName]; exists {
+		fmt.Printf("│  ✓ Registry entry exists\n")
+		if slot.Project == project {
+			fmt.Printf("│  ✓ Project matches: %s\n", slot.Project)
+		} else {
+			fmt.Printf("│  ✗ Project mismatch: registry=%s, detected=%s\n", slot.Project, project)
+			errors++
+		}
+		if slot.Number == slotNum {
+			fmt.Printf("│  ✓ Slot number matches: %d\n", slot.Number)
+		} else {
+			fmt.Printf("│  ✗ Slot number mismatch: registry=%d, detected=%d\n", slot.Number, slotNum)
+			errors++
+		}
+		if slot.Branch == slotBranch {
+			fmt.Printf("│  ✓ Branch matches: %s\n", slot.Branch)
+		} else {
+			fmt.Printf("│  ✗ Branch mismatch: registry=%s, actual=%s\n", slot.Branch, slotBranch)
+			errors++
+		}
+		fmt.Printf("│  Created: %s\n", slot.CreatedAt)
+	} else {
+		fmt.Println("│  ⚠ No registry entry (slot may have been created manually)")
+		warnings++
+	}
+	fmt.Println("└──────────────────────────────────────")
+	fmt.Println()
+
+	// 4. Check uncommitted changes
+	fmt.Println("┌─ Working Tree")
+	out, _ := exec.Command("git", "-C", slotPath, "status", "--porcelain").Output()
+	if len(out) == 0 {
+		fmt.Println("│  ✓ Clean working tree")
+	} else {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		fmt.Printf("│  ⚠ %d uncommitted changes\n", len(lines))
+		warnings++
+	}
+	fmt.Println("└──────────────────────────────────────")
+	fmt.Println()
+
+	// Summary
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	if errors == 0 && warnings == 0 {
+		fmt.Println("  ✓ VERIFIED: Slot matches parent worktree 1:1")
+	} else if errors == 0 {
+		fmt.Printf("  ✓ VERIFIED with %d warning(s)\n", warnings)
+	} else {
+		fmt.Printf("  ✗ FAILED: %d error(s), %d warning(s)\n", errors, warnings)
+	}
+	fmt.Println("═══════════════════════════════════════════════════════════")
+
+	if errors > 0 {
+		os.Exit(1)
+	}
+}
+
+func cmdFixPorts() {
+	cwd, _ := os.Getwd()
+	mainRepo, project := detectProject(cwd)
+
+	if mainRepo == "" {
+		fmt.Println("Error: not in a git repository")
+		os.Exit(1)
+	}
+
+	// Must be run from slot (worktree)
+	if mainRepo == cwd {
+		fmt.Println("Error: must run from a slot worktree, not main")
+		os.Exit(1)
+	}
+
+	slotPath := cwd
+
+	// Extract slot number from directory name
+	base := filepath.Base(slotPath)
+	re := regexp.MustCompile(`-(\d+)$`)
+	m := re.FindStringSubmatch(base)
+	if len(m) < 2 {
+		fmt.Println("Error: could not detect slot number from directory name")
+		os.Exit(1)
+	}
+	slotNum, _ := strconv.Atoi(m[1])
+	slotName := fmt.Sprintf("%s-%d", project, slotNum)
+
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Printf("  FIX PORTS: %s (slot %d)\n", slotName, slotNum)
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Println()
+
+	// Scan main's ports
+	fmt.Println("Scanning main project ports...")
+	mainPorts := scanPorts(mainRepo)
+
+	if len(mainPorts) == 0 {
+		fmt.Println("No ports found in main project")
+		return
+	}
+
+	// Calculate expected slot ports
+	portMap := make(map[int]int)
+	for mainPort, varName := range mainPorts {
+		slotPort := mainPort + slotNum
+		portMap[mainPort] = slotPort
+		fmt.Printf("  %s: %d → %d\n", varName, mainPort, slotPort)
+	}
+
+	fmt.Println()
+
+	// Scan current slot ports
+	fmt.Println("Checking slot ports...")
+	slotPorts := scanPorts(slotPath)
+
+	// Find mismatches
+	fixes := 0
+	for mainPort, expectedSlotPort := range portMap {
+		// Check if slot has this port at wrong value
+		for currentPort := range slotPorts {
+			if currentPort == mainPort {
+				fmt.Printf("  ✗ Found main port %d (should be %d)\n", mainPort, expectedSlotPort)
+				fixes++
+			}
+		}
+	}
+
+	if fixes == 0 {
+		// Check if ports are correct
+		allCorrect := true
+		for _, expectedSlotPort := range portMap {
+			if _, exists := slotPorts[expectedSlotPort]; !exists {
+				allCorrect = false
+				break
+			}
+		}
+		if allCorrect {
+			fmt.Println("  ✓ All ports are correct")
+			return
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("Fixing ports...")
+
+	// Update all files
+	updateSlotEnvFiles(slotPath, portMap, slotName)
+	updateConfigFiles(slotPath, portMap)
+
+	fmt.Println()
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Println("  ✓ Ports fixed")
+	fmt.Println("═══════════════════════════════════════════════════════════")
+	fmt.Println()
+	fmt.Println("Note: You may need to restart docker containers:")
+	fmt.Println("  docker compose down && docker compose up -d")
+}
+
+// scanPorts scans a directory for port configurations
+func scanPorts(dir string) map[int]string {
+	ports := make(map[int]string)
+
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		rel, _ := filepath.Rel(dir, path)
+		skipDirs := []string{"node_modules", ".next", "dist", ".git"}
+		for _, skip := range skipDirs {
+			if strings.Contains(rel, skip) {
+				return nil
+			}
+		}
+
+		baseName := filepath.Base(path)
+		isEnvFile := strings.Contains(baseName, ".env") && !strings.Contains(baseName, ".example")
+		isConfigFile := baseName == ".mcp.json" || baseName == "package.json"
+
+		if !isEnvFile && !isConfigFile {
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		portRe := regexp.MustCompile(`^([A-Z_]*PORT)=["']?(\d+)["']?`)
+		urlPortRe := regexp.MustCompile(`localhost:(\d+)`)
+		pFlagRe := regexp.MustCompile(`-p\s+(\d+)`)
+
+		for _, line := range strings.Split(string(content), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "#") {
+				continue
+			}
+
+			if isEnvFile {
+				if m := portRe.FindStringSubmatch(line); len(m) > 2 {
+					if port, err := strconv.Atoi(m[2]); err == nil && port > 1000 {
+						if _, exists := ports[port]; !exists {
+							ports[port] = m[1]
+						}
+					}
+				}
+			}
+
+			for _, m := range urlPortRe.FindAllStringSubmatch(line, -1) {
+				if port, err := strconv.Atoi(m[1]); err == nil && port > 1000 {
+					if _, exists := ports[port]; !exists {
+						ports[port] = "URL"
+					}
+				}
+			}
+
+			if isConfigFile && baseName == "package.json" {
+				for _, m := range pFlagRe.FindAllStringSubmatch(line, -1) {
+					if port, err := strconv.Atoi(m[1]); err == nil && port > 1000 {
+						if _, exists := ports[port]; !exists {
+							ports[port] = "script"
+						}
+					}
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return ports
 }
 
 func cmdDBSync() {
@@ -554,7 +884,10 @@ func cmdDBSync() {
 
 		// Clone database
 		fmt.Printf("  Cloning %s...\n", pgDB)
-		cloneDatabase(mainPgPort, slotPgPort, pgUser, pgPass, pgDB)
+		if err := cloneDatabase(mainPgPort, slotPgPort, pgUser, pgPass, pgDB); err != nil {
+			fmt.Printf("  ✗ Failed to sync: %v\n", err)
+			continue
+		}
 		fmt.Println("  ✓ Database synced")
 		synced++
 	}
@@ -675,7 +1008,7 @@ func scanAndAllocatePorts(mainRepo string, slotNum int) map[int]int {
 
 	fmt.Println("Scanning main project ports...")
 
-	// Find all .env files
+	// Scan all relevant files for ports
 	filepath.Walk(mainRepo, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
@@ -690,45 +1023,59 @@ func scanAndAllocatePorts(mainRepo string, slotNum int) map[int]int {
 			}
 		}
 
-		// Only process .env* files
-		if !strings.Contains(filepath.Base(path), ".env") {
+		baseName := filepath.Base(path)
+		isEnvFile := strings.Contains(baseName, ".env") && !strings.Contains(baseName, ".example")
+		isConfigFile := baseName == ".mcp.json" || baseName == "package.json"
+
+		if !isEnvFile && !isConfigFile {
 			return nil
 		}
 
-		// Parse env file for ports
-		file, err := os.Open(path)
+		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
-		defer file.Close()
 
-		scanner := bufio.NewScanner(file)
 		portRe := regexp.MustCompile(`^([A-Z_]*PORT)=["']?(\d+)["']?`)
 		urlPortRe := regexp.MustCompile(`localhost:(\d+)`)
 
-		for scanner.Scan() {
-			line := scanner.Text()
-
+		for _, line := range strings.Split(string(content), "\n") {
 			// Skip comments
 			if strings.HasPrefix(strings.TrimSpace(line), "#") {
 				continue
 			}
 
-			// Check for PORT= or *_PORT= variables
-			if m := portRe.FindStringSubmatch(line); len(m) > 2 {
-				if port, err := strconv.Atoi(m[2]); err == nil && port > 1000 {
-					if _, exists := portMap[port]; !exists {
-						portVars[port] = m[1]
+			// Check for PORT= or *_PORT= variables (env files)
+			if isEnvFile {
+				if m := portRe.FindStringSubmatch(line); len(m) > 2 {
+					if port, err := strconv.Atoi(m[2]); err == nil && port > 1000 {
+						if _, exists := portMap[port]; !exists {
+							portVars[port] = m[1]
+						}
 					}
 				}
 			}
 
-			// Check for localhost:PORT in URLs
+			// Check for localhost:PORT in URLs (all files)
 			for _, m := range urlPortRe.FindAllStringSubmatch(line, -1) {
 				if port, err := strconv.Atoi(m[1]); err == nil && port > 1000 {
 					if _, exists := portMap[port]; !exists {
 						if _, hasVar := portVars[port]; !hasVar {
 							portVars[port] = "URL"
+						}
+					}
+				}
+			}
+
+			// Check for -p PORT in package.json scripts (storybook pattern)
+			if isConfigFile && baseName == "package.json" {
+				pFlagRe := regexp.MustCompile(`-p\s+(\d+)`)
+				for _, m := range pFlagRe.FindAllStringSubmatch(line, -1) {
+					if port, err := strconv.Atoi(m[1]); err == nil && port > 1000 {
+						if _, exists := portMap[port]; !exists {
+							if _, hasVar := portVars[port]; !hasVar {
+								portVars[port] = "script"
+							}
 						}
 					}
 				}
@@ -815,6 +1162,50 @@ func updateSlotEnvFiles(slotPath string, portMap map[int]int, slotName string) {
 
 			// Replace localhost:PORT
 			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("localhost:%d", mainPort), fmt.Sprintf("localhost:%d", slotPort))
+		}
+
+		if newContent != string(content) {
+			os.WriteFile(path, []byte(newContent), info.Mode())
+			fmt.Printf("  Updated: %s\n", rel)
+		}
+
+		return nil
+	})
+}
+
+func updateConfigFiles(slotPath string, portMap map[int]int) {
+	fmt.Println("\nUpdating config files...")
+
+	filepath.Walk(slotPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		rel, _ := filepath.Rel(slotPath, path)
+		skipDirs := []string{"node_modules", ".next", "dist", ".git"}
+		for _, skip := range skipDirs {
+			if strings.Contains(rel, skip) {
+				return nil
+			}
+		}
+
+		baseName := filepath.Base(path)
+		if baseName != ".mcp.json" && baseName != "package.json" {
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		newContent := string(content)
+
+		// Replace localhost:PORT patterns
+		for mainPort, slotPort := range portMap {
+			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("localhost:%d", mainPort), fmt.Sprintf("localhost:%d", slotPort))
+			// Replace -p PORT patterns in scripts
+			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("-p %d", mainPort), fmt.Sprintf("-p %d", slotPort))
 		}
 
 		if newContent != string(content) {
@@ -924,8 +1315,11 @@ func startDockerAndClone(mainRepo, slotPath string, portMap map[int]int) {
 		// Clone database if main is running
 		if mainPgPort > 0 && isPostgresReady(mainPgPort, pgUser, pgPass, pgDB) {
 			fmt.Printf("  Cloning database from port %d to %d...\n", mainPgPort, slotPgPort)
-			cloneDatabase(mainPgPort, slotPgPort, pgUser, pgPass, pgDB)
-			fmt.Println("  ✓ Database cloned")
+			if err := cloneDatabase(mainPgPort, slotPgPort, pgUser, pgPass, pgDB); err != nil {
+				fmt.Printf("  ✗ Failed to clone: %v\n", err)
+			} else {
+				fmt.Println("  ✓ Database cloned")
+			}
 		} else {
 			fmt.Printf("  ⚠ Main DB not running on port %d, skipping clone\n", mainPgPort)
 		}
@@ -1004,15 +1398,43 @@ func isPostgresReady(port int, user, pass, db string) bool {
 	return cmd.Run() == nil
 }
 
-func cloneDatabase(srcPort, dstPort int, user, pass, db string) {
-	// Use shell to pipe - avoids Go pipe deadlock issues
-	cmdStr := fmt.Sprintf(
-		"pg_dump -h localhost -p %d -U %s %s | psql -h localhost -p %d -U %s %s",
+func cloneDatabase(srcPort, dstPort int, user, pass, db string) error {
+	env := append(os.Environ(), "PGPASSWORD="+pass)
+
+	// 1. Terminate existing connections to target DB
+	terminateCmd := fmt.Sprintf(
+		`psql -h localhost -p %d -U %s -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='%s' AND pid <> pg_backend_pid();"`,
+		dstPort, user, db,
+	)
+	cmd := exec.Command("sh", "-c", terminateCmd)
+	cmd.Env = env
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to terminate connections: %w", err)
+	}
+
+	// 2. Drop and recreate target DB
+	dropCreateCmd := fmt.Sprintf(
+		`psql -h localhost -p %d -U %s -d postgres -c "DROP DATABASE IF EXISTS %s;" -c "CREATE DATABASE %s;"`,
+		dstPort, user, db, db,
+	)
+	cmd = exec.Command("sh", "-c", dropCreateCmd)
+	cmd.Env = env
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to drop/create database: %w", err)
+	}
+
+	// 3. Pipe dump to fresh DB
+	pipeCmd := fmt.Sprintf(
+		"pg_dump -h localhost -p %d -U %s --no-owner --no-acl %s | psql -h localhost -p %d -U %s %s",
 		srcPort, user, db, dstPort, user, db,
 	)
-	cmd := exec.Command("sh", "-c", cmdStr)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+pass)
-	cmd.Run()
+	cmd = exec.Command("sh", "-c", pipeCmd)
+	cmd.Env = env
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to restore database: %w", err)
+	}
+
+	return nil
 }
 
 func stopDocker(slotPath string) {

@@ -39,6 +39,7 @@ interface Slot {
   ports: {
     web: number;
     postgres: number;
+    storybook: number | null;
   };
   docker: DockerContainer | null;
   claude: ClaudeInstance | null;
@@ -119,6 +120,19 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   );
 }
 
+function PortLink({ port, label }: { port: number; label?: string }) {
+  return (
+    <a
+      href={`http://localhost:${port}`}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-emerald-400 hover:text-emerald-300 hover:underline transition-colors"
+    >
+      {label || port}
+    </a>
+  );
+}
+
 function SlotCard({ slot }: { slot: Slot }) {
   const isActive = slot.claude !== null;
   const hasDocker = slot.docker !== null;
@@ -153,8 +167,11 @@ function SlotCard({ slot }: { slot: Slot }) {
       </CardHeader>
       <CardContent className="px-4 pb-0 space-y-0">
         <Row label="branch"><span className="text-sky-400">{slot.branch}</span></Row>
-        <Row label="web">{slot.ports.web}</Row>
-        <Row label="db">{slot.ports.postgres}</Row>
+        <Row label="web"><PortLink port={slot.ports.web} /></Row>
+        <Row label="db"><span className="text-muted-foreground">{slot.ports.postgres}</span></Row>
+        {slot.ports.storybook && (
+          <Row label="storybook"><PortLink port={slot.ports.storybook} /></Row>
+        )}
         <Row label="docker">
           {hasDocker ? (
             <span className="flex items-center gap-1.5 min-w-0">

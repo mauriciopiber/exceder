@@ -50,6 +50,7 @@ interface Slot {
   ports: {
     web: number;
     postgres: number;
+    storybook: number | null;
   };
   docker: DockerContainer | null;
   claude: ClaudeInstance | null;
@@ -250,6 +251,42 @@ async function getClaudeInstances(): Promise<ClaudeInstance[]> {
   }
 }
 
+async function getStorybookPort(slotPath: string): Promise<number | null> {
+  try {
+    // Try to read STORYBOOK_PORT from .env files
+    for (const envFile of [".env.local", ".env"]) {
+      try {
+        const envPath = path.join(slotPath, envFile);
+        const content = await readFile(envPath, "utf-8");
+        const match = content.match(/STORYBOOK_PORT=["']?(\d+)["']?/);
+        if (match) {
+          return parseInt(match[1]);
+        }
+      } catch {
+        // File doesn't exist, continue
+      }
+    }
+    // Check apps/web/.env.local or similar nested locations
+    for (const subdir of ["apps/web", "packages/ui"]) {
+      for (const envFile of [".env.local", ".env"]) {
+        try {
+          const envPath = path.join(slotPath, subdir, envFile);
+          const content = await readFile(envPath, "utf-8");
+          const match = content.match(/STORYBOOK_PORT=["']?(\d+)["']?/);
+          if (match) {
+            return parseInt(match[1]);
+          }
+        } catch {
+          // File doesn't exist, continue
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function getBranchForPath(dirPath: string): Promise<string> {
   try {
     const { stdout } = await execAsync(
@@ -269,56 +306,67 @@ export async function GET() {
   ]);
 
   // Build slots with docker and claude info
-  const slots: Slot[] = Object.entries(registry.slots).map(([name, slot]) => {
-    const project = registry.projects[slot.project];
-    const basePort = project?.base_port || 3000;
-    const projectOffset = Math.floor((basePort - 3000) / 10);
+  const slotsWithStorybook = await Promise.all(
+    Object.entries(registry.slots).map(async ([name, slot]) => {
+      const project = registry.projects[slot.project];
+      const basePort = project?.base_port || 3000;
+      const projectOffset = Math.floor((basePort - 3000) / 10);
 
-    const slotPath = project?.path
-      ? path.join(path.dirname(project.path), name)
-      : "";
+      const slotPath = project?.path
+        ? path.join(path.dirname(project.path), name)
+        : "";
 
-    return {
-      name,
-      project: slot.project,
-      number: slot.number,
-      branch: slot.branch,
-      path: slotPath,
-      createdAt: slot.created_at,
-      ports: {
-        web: basePort + slot.number,
-        postgres: 5432 + projectOffset + slot.number,
-      },
-      docker: containers.find((c) => c.name === `${name}-db`) || null,
-      // Match claude by exact path OR subdirectories within the slot
-      claude: claudes.find((c) =>
-        slotPath && (c.cwd === slotPath || c.cwd.startsWith(slotPath + "/"))
-      ) || null,
-      tags: slot.tags || [],
-    };
-  });
+      const storybookPort = slotPath ? await getStorybookPort(slotPath) : null;
+
+      return {
+        name,
+        project: slot.project,
+        number: slot.number,
+        branch: slot.branch,
+        path: slotPath,
+        createdAt: slot.created_at,
+        ports: {
+          web: basePort + slot.number,
+          postgres: 5432 + projectOffset + slot.number,
+          storybook: storybookPort,
+        },
+        docker: containers.find((c) => c.name === `${name}-db`) || null,
+        // Match claude by exact path OR subdirectories within the slot
+        claude: claudes.find((c) =>
+          slotPath && (c.cwd === slotPath || c.cwd.startsWith(slotPath + "/"))
+        ) || null,
+        tags: slot.tags || [],
+      };
+    })
+  );
+  const slots: Slot[] = slotsWithStorybook;
 
   // Create "main" slot for each registered project (the parent worktree)
-  const mainSlots: Slot[] = Object.entries(registry.projects).map(([name, project]) => {
-    const mainPath = project.path;
-    return {
-      name: name,
-      project: name,
-      number: 0, // main is always slot 0
-      branch: "main",
-      path: mainPath,
-      createdAt: "",
-      ports: {
-        web: project.base_port,
-        postgres: 5432 + Math.floor((project.base_port - 3000) / 10),
-      },
-      docker: containers.find((c) => c.name === `${name}-db`) || null,
-      claude: claudes.find((c) =>
-        mainPath && (c.cwd === mainPath || c.cwd.startsWith(mainPath + "/"))
-      ) || null,
-      tags: [],
-    };
-  });
+  const mainSlotsWithStorybook = await Promise.all(
+    Object.entries(registry.projects).map(async ([name, project]) => {
+      const mainPath = project.path;
+      const storybookPort = mainPath ? await getStorybookPort(mainPath) : null;
+      return {
+        name: name,
+        project: name,
+        number: 0, // main is always slot 0
+        branch: "main",
+        path: mainPath,
+        createdAt: "",
+        ports: {
+          web: project.base_port,
+          postgres: 5432 + Math.floor((project.base_port - 3000) / 10),
+          storybook: storybookPort,
+        },
+        docker: containers.find((c) => c.name === `${name}-db`) || null,
+        claude: claudes.find((c) =>
+          mainPath && (c.cwd === mainPath || c.cwd.startsWith(mainPath + "/"))
+        ) || null,
+        tags: [],
+      };
+    })
+  );
+  const mainSlots: Slot[] = mainSlotsWithStorybook;
 
   // Group by project (main + numbered slots)
   const projectGroups: ProjectGroup[] = Object.entries(registry.projects).map(
