@@ -2988,7 +2988,7 @@ func cloneDatabase(srcPort, dstPort int, user, pass, db string) error {
 
 	// 3. Pipe dump to fresh DB
 	pipeCmd := fmt.Sprintf(
-		"pg_dump -h localhost -p %d -U %s --no-owner --no-acl %s | psql -h localhost -p %d -U %s %s",
+		"pg_dump -h localhost -p %d -U %s --no-owner %s | psql -h localhost -p %d -U %s %s",
 		srcPort, user, db, dstPort, user, db,
 	)
 	cmd = exec.Command("sh", "-c", pipeCmd)
