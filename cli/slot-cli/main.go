@@ -220,16 +220,9 @@ func cmdInit(args []string) {
 	fmt.Println("  slot-cli list       See status")
 }
 
-func resolveSlotName(args []string) string {
-	cwd, _ := os.Getwd()
-	_, project := detectProject(cwd)
-	slotName := filepath.Base(cwd)
+func resolveSlotNamePure(project, cwdBase string, cwdIsSlot bool, args []string) string {
+	slotName := cwdBase
 
-	// Check if cwd is already a registered slot
-	reg := loadRegistry()
-	_, cwdIsSlot := reg.Slots[slotName]
-
-	// Only use args as slot identifier if we're NOT already in a slot dir
 	if !cwdIsSlot {
 		for _, arg := range args {
 			if arg == "--force" || arg == "-f" || strings.HasPrefix(arg, "--") {
@@ -244,6 +237,17 @@ func resolveSlotName(args []string) string {
 		}
 	}
 	return slotName
+}
+
+func resolveSlotName(args []string) string {
+	cwd, _ := os.Getwd()
+	_, project := detectProject(cwd)
+	cwdBase := filepath.Base(cwd)
+
+	reg := loadRegistry()
+	_, cwdIsSlot := reg.Slots[cwdBase]
+
+	return resolveSlotNamePure(project, cwdBase, cwdIsSlot, args)
 }
 
 func cmdLock(args []string) {
@@ -2214,6 +2218,19 @@ func cmdFixPorts() {
 	fmt.Println("  docker compose down && docker compose up -d")
 }
 
+func extractPortFromEnvLine(line string) (varName string, port int, ok bool) {
+	portRe := regexp.MustCompile(`^([A-Z_]*PORT)=["']?(\d+)["']?`)
+	m := portRe.FindStringSubmatch(line)
+	if len(m) < 3 {
+		return "", 0, false
+	}
+	p, err := strconv.Atoi(m[2])
+	if err != nil || p <= 1000 {
+		return "", 0, false
+	}
+	return m[1], p, true
+}
+
 // scanPorts scans a directory for port configurations
 func scanPorts(dir string) map[int]string {
 	ports := make(map[int]string)
@@ -2232,7 +2249,7 @@ func scanPorts(dir string) map[int]string {
 		}
 
 		baseName := filepath.Base(path)
-		isEnvFile := strings.Contains(baseName, ".env") && !strings.Contains(baseName, ".example")
+		isEnvFile := strings.Contains(baseName, ".env") && !strings.Contains(baseName, ".example") && !strings.Contains(baseName, ".sample")
 		isConfigFile := baseName == ".mcp.json" || baseName == "package.json"
 
 		if !isEnvFile && !isConfigFile {
@@ -2244,7 +2261,6 @@ func scanPorts(dir string) map[int]string {
 			return nil
 		}
 
-		portRe := regexp.MustCompile(`^([A-Z_]*PORT)=["']?(\d+)["']?`)
 		urlPortRe := regexp.MustCompile(`localhost:(\d+)`)
 		pFlagRe := regexp.MustCompile(`-p\s+(\d+)`)
 
@@ -2254,11 +2270,9 @@ func scanPorts(dir string) map[int]string {
 			}
 
 			if isEnvFile {
-				if m := portRe.FindStringSubmatch(line); len(m) > 2 {
-					if port, err := strconv.Atoi(m[2]); err == nil && port > 1000 {
-						if _, exists := ports[port]; !exists {
-							ports[port] = m[1]
-						}
+				if varName, port, ok := extractPortFromEnvLine(line); ok {
+					if _, exists := ports[port]; !exists {
+						ports[port] = varName
 					}
 				}
 			}
@@ -2305,7 +2319,8 @@ func cmdDBSync() {
 
 	slotPath := cwd
 
-	fmt.Println("Syncing database from main worktree...\n")
+	fmt.Println("Syncing database from main worktree...")
+	fmt.Println()
 
 	// Find docker-compose files in slot
 	composeFiles := []string{}
@@ -2527,7 +2542,7 @@ func scanAndAllocatePorts(mainRepo string, slotNum int) map[int]int {
 		}
 
 		baseName := filepath.Base(path)
-		isEnvFile := strings.Contains(baseName, ".env") && !strings.Contains(baseName, ".example")
+		isEnvFile := strings.Contains(baseName, ".env") && !strings.Contains(baseName, ".example") && !strings.Contains(baseName, ".sample")
 		isConfigFile := baseName == ".mcp.json" || baseName == "package.json"
 
 		if !isEnvFile && !isConfigFile {
@@ -2588,18 +2603,47 @@ func scanAndAllocatePorts(mainRepo string, slotNum int) map[int]int {
 		return nil
 	})
 
-	// Allocate slot ports
-	for mainPort, varName := range portVars {
-		slotPort := mainPort + slotNum
+	// Allocate slot ports (collision-aware)
+	portMap = allocateSlotPorts(portVars, slotNum)
 
-		// Check if port is available, find next if not
+	// Verify system availability and adjust if needed
+	for mainPort, slotPort := range portMap {
 		for !isPortAvailable(slotPort) {
 			fmt.Printf("  Port %d in use, trying next...\n", slotPort)
 			slotPort++
 		}
-
 		portMap[mainPort] = slotPort
-		fmt.Printf("  %s: %d → %d\n", varName, mainPort, slotPort)
+		fmt.Printf("  %s: %d → %d\n", portVars[mainPort], mainPort, slotPort)
+	}
+
+	return portMap
+}
+
+// allocateSlotPorts is a pure function that allocates slot ports while avoiding
+// collisions with main ports and already-allocated slot ports.
+func allocateSlotPorts(mainPorts map[int]string, slotNum int) map[int]int {
+	// Build reserved set from all main port values
+	reserved := make(map[int]bool)
+	for port := range mainPorts {
+		reserved[port] = true
+	}
+
+	// Sort main ports for deterministic allocation order
+	sorted := make([]int, 0, len(mainPorts))
+	for port := range mainPorts {
+		sorted = append(sorted, port)
+	}
+	sort.Ints(sorted)
+
+	portMap := make(map[int]int)
+	for _, mainPort := range sorted {
+		slotPort := mainPort + slotNum
+		// Skip ports that are reserved (main ports or already-allocated slot ports)
+		for reserved[slotPort] {
+			slotPort++
+		}
+		portMap[mainPort] = slotPort
+		reserved[slotPort] = true
 	}
 
 	return portMap
@@ -2614,9 +2658,30 @@ func isPortAvailable(port int) bool {
 	return true
 }
 
-func updateSlotEnvFiles(slotPath string, portMap map[int]int, slotName string) {
+func replacePortsInEnvContent(content string, portMap map[int]int, slotName string) string {
 	dockerName := strings.ToLower(regexp.MustCompile(`[^a-z0-9-]`).ReplaceAllString(slotName, "-"))
 
+	newContent := content
+
+	// Replace or add COMPOSE_PROJECT_NAME
+	composeRe := regexp.MustCompile(`(?m)^COMPOSE_PROJECT_NAME=.*$`)
+	if composeRe.MatchString(newContent) {
+		newContent = composeRe.ReplaceAllString(newContent, "COMPOSE_PROJECT_NAME="+dockerName)
+	} else {
+		newContent = "COMPOSE_PROJECT_NAME=" + dockerName + "\n" + newContent
+	}
+
+	// Replace each port
+	for mainPort, slotPort := range portMap {
+		newContent = strings.ReplaceAll(newContent, fmt.Sprintf("=%d", mainPort), fmt.Sprintf("=%d", slotPort))
+		newContent = strings.ReplaceAll(newContent, fmt.Sprintf("=\"%d\"", mainPort), fmt.Sprintf("=\"%d\"", slotPort))
+		newContent = strings.ReplaceAll(newContent, fmt.Sprintf("localhost:%d", mainPort), fmt.Sprintf("localhost:%d", slotPort))
+	}
+
+	return newContent
+}
+
+func updateSlotEnvFiles(slotPath string, portMap map[int]int, slotName string) {
 	fmt.Println("\nUpdating slot .env files...")
 
 	filepath.Walk(slotPath, func(path string, info os.FileInfo, err error) error {
@@ -2636,8 +2701,7 @@ func updateSlotEnvFiles(slotPath string, portMap map[int]int, slotName string) {
 		if !strings.Contains(baseName, ".env") {
 			return nil
 		}
-		// Skip example files - they should remain as templates
-		if strings.Contains(baseName, ".example") {
+		if strings.Contains(baseName, ".example") || strings.Contains(baseName, ".sample") {
 			return nil
 		}
 
@@ -2646,26 +2710,7 @@ func updateSlotEnvFiles(slotPath string, portMap map[int]int, slotName string) {
 			return nil
 		}
 
-		newContent := string(content)
-
-		// Replace or add COMPOSE_PROJECT_NAME
-		composeRe := regexp.MustCompile(`(?m)^COMPOSE_PROJECT_NAME=.*$`)
-		if composeRe.MatchString(newContent) {
-			newContent = composeRe.ReplaceAllString(newContent, "COMPOSE_PROJECT_NAME="+dockerName)
-		} else {
-			// Add at the beginning of file
-			newContent = "COMPOSE_PROJECT_NAME=" + dockerName + "\n" + newContent
-		}
-
-		// Replace each port
-		for mainPort, slotPort := range portMap {
-			// Replace =PORT and ="PORT"
-			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("=%d", mainPort), fmt.Sprintf("=%d", slotPort))
-			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("=\"%d\"", mainPort), fmt.Sprintf("=\"%d\"", slotPort))
-
-			// Replace localhost:PORT
-			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("localhost:%d", mainPort), fmt.Sprintf("localhost:%d", slotPort))
-		}
+		newContent := replacePortsInEnvContent(string(content), portMap, slotName)
 
 		if newContent != string(content) {
 			os.WriteFile(path, []byte(newContent), info.Mode())
@@ -2829,26 +2874,44 @@ func startDockerAndClone(mainRepo, slotPath string, portMap map[int]int) {
 	}
 }
 
-func parseDockerCompose(path string) (user, pass, db string) {
+func parseDockerComposeContent(content string) (user, pass, db string) {
 	user, pass, db = "postgres", "postgres", "postgres"
 
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "POSTGRES_USER:") {
-			user = strings.Trim(strings.TrimPrefix(line, "POSTGRES_USER:"), " \"'")
+			if v := strings.Trim(strings.TrimPrefix(line, "POSTGRES_USER:"), " \"'"); v != "" {
+				user = v
+			}
 		} else if strings.HasPrefix(line, "POSTGRES_PASSWORD:") {
-			pass = strings.Trim(strings.TrimPrefix(line, "POSTGRES_PASSWORD:"), " \"'")
+			if v := strings.Trim(strings.TrimPrefix(line, "POSTGRES_PASSWORD:"), " \"'"); v != "" {
+				pass = v
+			}
 		} else if strings.HasPrefix(line, "POSTGRES_DB:") {
-			db = strings.Trim(strings.TrimPrefix(line, "POSTGRES_DB:"), " \"'")
+			if v := strings.Trim(strings.TrimPrefix(line, "POSTGRES_DB:"), " \"'"); v != "" {
+				db = v
+			}
 		}
 	}
 	return
+}
+
+func parseDockerCompose(path string) (user, pass, db string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "postgres", "postgres", "postgres"
+	}
+	return parseDockerComposeContent(string(content))
+}
+
+func parseEnvVarInt(content, varName string) int {
+	re := regexp.MustCompile(fmt.Sprintf(`(?m)^%s=["']?(\d+)["']?`, regexp.QuoteMeta(varName)))
+	if m := re.FindStringSubmatch(content); len(m) > 1 {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 func readEnvVar(path, varName string) int {
@@ -2856,14 +2919,7 @@ func readEnvVar(path, varName string) int {
 	if err != nil {
 		return 0
 	}
-
-	re := regexp.MustCompile(fmt.Sprintf(`(?m)^%s=["']?(\d+)["']?`, varName))
-	if m := re.FindStringSubmatch(string(content)); len(m) > 1 {
-		if n, err := strconv.Atoi(m[1]); err == nil {
-			return n
-		}
-	}
-	return 0
+	return parseEnvVarInt(string(content), varName)
 }
 
 func startDockerCompose(dir string) {
@@ -2904,10 +2960,14 @@ func isPostgresReady(port int, user, pass, db string) bool {
 func cloneDatabase(srcPort, dstPort int, user, pass, db string) error {
 	env := append(os.Environ(), "PGPASSWORD="+pass)
 
+	// Use template1 as maintenance DB to avoid "cannot drop currently open database"
+	// when the target database is named "postgres"
+	maintDB := "template1"
+
 	// 1. Terminate existing connections to target DB
 	terminateCmd := fmt.Sprintf(
-		`psql -h localhost -p %d -U %s -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='%s' AND pid <> pg_backend_pid();"`,
-		dstPort, user, db,
+		`psql -h localhost -p %d -U %s -d %s -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='%s' AND pid <> pg_backend_pid();"`,
+		dstPort, user, maintDB, db,
 	)
 	cmd := exec.Command("sh", "-c", terminateCmd)
 	cmd.Env = env
@@ -2917,8 +2977,8 @@ func cloneDatabase(srcPort, dstPort int, user, pass, db string) error {
 
 	// 2. Drop and recreate target DB
 	dropCreateCmd := fmt.Sprintf(
-		`psql -h localhost -p %d -U %s -d postgres -c "DROP DATABASE IF EXISTS %s;" -c "CREATE DATABASE %s;"`,
-		dstPort, user, db, db,
+		`psql -h localhost -p %d -U %s -d %s -c "DROP DATABASE IF EXISTS %s;" -c "CREATE DATABASE %s;"`,
+		dstPort, user, maintDB, db, db,
 	)
 	cmd = exec.Command("sh", "-c", dropCreateCmd)
 	cmd.Env = env

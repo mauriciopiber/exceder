@@ -438,7 +438,7 @@ async function getEnvPort(
       try {
         const envPath = path.join(slotPath, subdir, envFile);
         const content = await readFile(envPath, "utf-8");
-        const regex = new RegExp(`${varName}=["']?(\\d+)["']?`);
+        const regex = new RegExp(`^${varName}=["']?(\\d+)["']?`, "m");
         const match = content.match(regex);
         if (match) {
           return parseInt(match[1], 10);
