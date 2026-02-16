@@ -8,7 +8,8 @@ Git worktree management for parallel Claude sessions. Use `slot-cli` directly in
 |---------|-------|------|
 | `slot-cli new [N\|name]` | main repo | Create slot (number or name, auto-increments if omitted) |
 | `slot-cli delete <N\|name>` | main repo | Delete slot |
-| `slot-cli done` | slot dir | Merge into main + cleanup |
+| `slot-cli merge <N>` | main repo | Merge slot branch into main (keeps slot alive) |
+| `slot-cli done` | slot dir | Merge into main + DELETE slot (destructive!) |
 | `slot-cli pr` | slot dir | Push + create PR |
 | `slot-cli start` | slot dir | Fresh Claude session |
 | `slot-cli continue` | slot dir | Resume last session |

@@ -2,6 +2,7 @@
 
 - **Don't assume actions** - If user says "check the UI", don't take screenshots unless asked. Just confirm it's running.
 - **Wait when told** - If user says "wait", stop and wait for next instruction.
+- **MERGE ≠ done** - CRITICAL: When the user says "merge", ALWAYS run `slot-cli merge <N>`. NEVER run `slot-cli done`. NEVER run `git merge`. The ONLY correct command for "merge" is `slot-cli merge <N>`. Only run `slot-cli done` if the user literally says "done".
 
 # Global Commands
 
@@ -19,7 +20,8 @@ Source: `~/Projects/piber/exceder`
 |---------|-------|------|
 | `slot-cli new [N\|name]` | main repo | Create slot (number or name, auto-increments) |
 | `slot-cli delete <N\|name>` | main repo | Delete slot (--force to skip confirmation) |
-| `slot-cli done` | slot dir | Merge into main + cleanup |
+| `slot-cli merge <N>` | main repo | Merge slot branch into main (keeps slot alive) |
+| `slot-cli done` | slot dir | Merge into main + DELETE slot (destructive!) |
 | `slot-cli pr` | slot dir | Push + create PR |
 | `slot-cli start` | slot dir | Fresh Claude session |
 | `slot-cli continue` | slot dir | Resume last session |
