@@ -1,0 +1,94 @@
+{
+
+  "diffEditor.ignoreTrimWhitespace": true,
+  "editor.multiCursorModifier": "ctrlCmd",
+  "editor.semanticHighlighting.enabled": false,
+  "editor.formatOnPaste": false,
+  "editor.tabSize": 2,
+  "editor.codeActionsOnSave": {
+    "quickfix.biome": "explicit"
+  },
+  "editor.wordWrap": "on",
+  "editor.renderWhitespace": "all",
+  "editor.cursorStyle": "underline",
+  "workbench.editor.enablePreview": false,
+  "explorer.confirmDragAndDrop": false,
+  "explorer.confirmDelete": false,
+  "files.exclude": {
+    "**/node_modules/*/**": true,
+    "**/vendor/*/**": true
+  },
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "files.trimTrailingWhitespace": true,
+  "[typescript]": {
+    "editor.tabSize": 2,
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[scss]": {
+    "editor.tabSize": 2
+  },
+  "javascript.updateImportsOnFileMove.enabled": "never",
+  "[perl]": {
+    "files.insertFinalNewline": false
+  },
+  "[yml]": {
+    "editor.autoIndent": "advanced"
+  },
+  "editor.copyWithSyntaxHighlighting": false,
+  "typescript.updateImportsOnFileMove.enabled": "always",
+  "glassit.alpha": 255,
+  "terminal.integrated.tabs.enabled": true,
+  "editor.inlineSuggest.enabled": true,
+  "svelte.enable-ts-plugin": true,
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "git.openRepositoryInParentFolders": "never",
+  "workbench.editor.empty.hint": "hidden",
+  "files.associations": {
+    "*.svelte": "svelte",
+    "*.astro": "astro",
+    ".env.development*": "env",
+    ".env.production*": "env",
+    ".env.local*": "env",
+    ".env.sample": "env",
+    ".env.test*": "env",
+    "*.css": "tailwindcss",
+    "*.sql": "sql",
+    "*.pdf": "pdf"
+  },
+    "window.restoreWindows": "all",
+  "workbench.startupEditor": "none",
+  "editor.minimap.enabled": true,
+  "explorer.confirmPasteNative": false,
+  "codeium.enableCodeLens": false,
+  "editor.defaultFormatter": "biomejs.biome",
+  "editor.formatOnSave": true,
+  "[javascript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[sql]": {
+    "editor.defaultFormatter": "bradymholt.pgformatter"
+  },
+  "[html]": {
+    "editor.defaultFormatter": "vscode.html-language-features"
+  },
+  "window.commandCenter": true,
+  "workbench.colorTheme": "One Dark Pro",
+  "workbench.activityBar.orientation": "vertical",
+  "[postgres]": {
+    "editor.defaultFormatter": "inferrinizzard.prettier-sql-vscode"
+  },
+  "SQL-Formatter-VSCode.dialect": "postgresql",
+  "extensions.ignoreRecommendations": true,
+  "[dockercompose]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2,
+    "editor.autoIndent": "advanced",
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+  },
+  "[github-actions-workflow]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+  }
+}

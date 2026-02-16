@@ -10,6 +10,8 @@ node_modules/
 # Next.js
 .next/
 out/
+app/next-env.d.ts
+app/tsconfig.tsbuildinfo
 
 # Build
 dist/
