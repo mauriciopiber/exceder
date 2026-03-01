@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -456,4 +459,131 @@ func TestAllocateSlotPortsNoDuplicates(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestEnsureDockerComposeEnvFiles(t *testing.T) {
+	t.Run("generates env from compose variables", func(t *testing.T) {
+		dir := t.TempDir()
+		compose := `services:
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    container_name: ${COMPOSE_PROJECT_NAME:-myapp}-db
+`
+		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+		portMap := map[int]int{5432: 5434}
+		ensureDockerComposeEnvFiles(dir, portMap, "myapp-1")
+
+		content, err := os.ReadFile(filepath.Join(dir, ".env"))
+		if err != nil {
+			t.Fatalf("expected .env to be created: %v", err)
+		}
+
+		s := string(content)
+		if !strings.Contains(s, "COMPOSE_PROJECT_NAME=myapp-1") {
+			t.Errorf("expected COMPOSE_PROJECT_NAME=myapp-1, got:\n%s", s)
+		}
+		if !strings.Contains(s, "POSTGRES_PORT=5434") {
+			t.Errorf("expected POSTGRES_PORT=5434, got:\n%s", s)
+		}
+	})
+
+	t.Run("uses env.example as template", func(t *testing.T) {
+		dir := t.TempDir()
+		compose := `services:
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+`
+		example := "POSTGRES_PORT=5432\nAPP_NAME=myapp\n"
+		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+		os.WriteFile(filepath.Join(dir, ".env.example"), []byte(example), 0644)
+
+		portMap := map[int]int{5432: 5434}
+		ensureDockerComposeEnvFiles(dir, portMap, "myapp-1")
+
+		content, err := os.ReadFile(filepath.Join(dir, ".env"))
+		if err != nil {
+			t.Fatalf("expected .env to be created: %v", err)
+		}
+
+		s := string(content)
+		if !strings.Contains(s, "POSTGRES_PORT=5434") {
+			t.Errorf("expected POSTGRES_PORT=5434, got:\n%s", s)
+		}
+		if !strings.Contains(s, "COMPOSE_PROJECT_NAME=myapp-1") {
+			t.Errorf("expected COMPOSE_PROJECT_NAME, got:\n%s", s)
+		}
+		if !strings.Contains(s, "APP_NAME=myapp") {
+			t.Errorf("expected APP_NAME preserved, got:\n%s", s)
+		}
+	})
+
+	t.Run("skips when env already exists", func(t *testing.T) {
+		dir := t.TempDir()
+		compose := `services:
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+`
+		existing := "POSTGRES_PORT=9999\n"
+		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+		os.WriteFile(filepath.Join(dir, ".env"), []byte(existing), 0644)
+
+		portMap := map[int]int{5432: 5434}
+		ensureDockerComposeEnvFiles(dir, portMap, "myapp-1")
+
+		content, _ := os.ReadFile(filepath.Join(dir, ".env"))
+		if string(content) != existing {
+			t.Errorf("expected .env to be unchanged, got:\n%s", string(content))
+		}
+	})
+
+	t.Run("skips when env.local exists", func(t *testing.T) {
+		dir := t.TempDir()
+		compose := `services:
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+`
+		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+		os.WriteFile(filepath.Join(dir, ".env.local"), []byte("POSTGRES_PORT=5434\n"), 0644)
+
+		portMap := map[int]int{5432: 5434}
+		ensureDockerComposeEnvFiles(dir, portMap, "myapp-1")
+
+		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
+			t.Error("expected .env NOT to be created when .env.local exists")
+		}
+	})
+
+	t.Run("handles multiple ports", func(t *testing.T) {
+		dir := t.TempDir()
+		compose := `services:
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+  redis:
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+`
+		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+		portMap := map[int]int{5432: 5434, 6379: 6381}
+		ensureDockerComposeEnvFiles(dir, portMap, "myapp-2")
+
+		content, err := os.ReadFile(filepath.Join(dir, ".env"))
+		if err != nil {
+			t.Fatalf("expected .env: %v", err)
+		}
+
+		s := string(content)
+		if !strings.Contains(s, "POSTGRES_PORT=5434") {
+			t.Errorf("expected POSTGRES_PORT=5434, got:\n%s", s)
+		}
+		if !strings.Contains(s, "REDIS_PORT=6381") {
+			t.Errorf("expected REDIS_PORT=6381, got:\n%s", s)
+		}
+	})
 }

@@ -541,6 +541,7 @@ func cmdNew(args []string) {
 		updateSlotEnvFiles(slotPath, portMap, slotName)
 		updateConfigFiles(slotPath, portMap)
 		updateDockerComposeFiles(slotPath, slotName)
+		ensureDockerComposeEnvFiles(slotPath, portMap, slotName)
 		fmt.Println("✓ Port mapping complete")
 
 		// Start docker and clone database
@@ -2542,8 +2543,8 @@ func scanAndAllocatePorts(mainRepo string, slotNum int) map[int]int {
 		}
 
 		baseName := filepath.Base(path)
-		isEnvFile := strings.Contains(baseName, ".env") && !strings.Contains(baseName, ".example") && !strings.Contains(baseName, ".sample")
-		isConfigFile := baseName == ".mcp.json" || baseName == "package.json"
+		isEnvFile := (baseName == ".env" || baseName == ".env.local")
+		isConfigFile := baseName == ".mcp.json"
 
 		if !isEnvFile && !isConfigFile {
 			return nil
@@ -2580,20 +2581,6 @@ func scanAndAllocatePorts(mainRepo string, slotNum int) map[int]int {
 					if _, exists := portMap[port]; !exists {
 						if _, hasVar := portVars[port]; !hasVar {
 							portVars[port] = "URL"
-						}
-					}
-				}
-			}
-
-			// Check for -p PORT in package.json scripts (storybook pattern)
-			if isConfigFile && baseName == "package.json" {
-				pFlagRe := regexp.MustCompile(`-p\s+(\d+)`)
-				for _, m := range pFlagRe.FindAllStringSubmatch(line, -1) {
-					if port, err := strconv.Atoi(m[1]); err == nil && port > 1000 {
-						if _, exists := portMap[port]; !exists {
-							if _, hasVar := portVars[port]; !hasVar {
-								portVars[port] = "script"
-							}
 						}
 					}
 				}
@@ -2701,7 +2688,8 @@ func updateSlotEnvFiles(slotPath string, portMap map[int]int, slotName string) {
 		if !strings.Contains(baseName, ".env") {
 			return nil
 		}
-		if strings.Contains(baseName, ".example") || strings.Contains(baseName, ".sample") {
+		// Only modify .env and .env.local — skip .env.production, .env.staging, .env.test, .env.example, etc.
+		if baseName != ".env" && baseName != ".env.local" {
 			return nil
 		}
 
@@ -2738,7 +2726,8 @@ func updateConfigFiles(slotPath string, portMap map[int]int) {
 		}
 
 		baseName := filepath.Base(path)
-		if baseName != ".mcp.json" && baseName != "package.json" {
+		// Only modify .mcp.json (gitignored) — skip package.json (tracked, creates dirty files)
+		if baseName != ".mcp.json" {
 			return nil
 		}
 
@@ -2752,8 +2741,6 @@ func updateConfigFiles(slotPath string, portMap map[int]int) {
 		// Replace localhost:PORT patterns
 		for mainPort, slotPort := range portMap {
 			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("localhost:%d", mainPort), fmt.Sprintf("localhost:%d", slotPort))
-			// Replace -p PORT patterns in scripts
-			newContent = strings.ReplaceAll(newContent, fmt.Sprintf("-p %d", mainPort), fmt.Sprintf("-p %d", slotPort))
 		}
 
 		if newContent != string(content) {
@@ -2794,6 +2781,88 @@ func updateDockerComposeFiles(slotPath, slotName string) {
 			rel, _ := filepath.Rel(slotPath, path)
 			fmt.Printf("  Updated: %s (container_name)\n", rel)
 		}
+
+		return nil
+	})
+}
+
+// ensureDockerComposeEnvFiles creates .env files next to docker-compose.yml
+// when they don't exist. Without this, docker-compose uses fallback defaults
+// for ${VAR:-default} references instead of the slot-specific ports.
+func ensureDockerComposeEnvFiles(slotPath string, portMap map[int]int, slotName string) {
+	dockerName := strings.ToLower(regexp.MustCompile(`[^a-z0-9-]`).ReplaceAllString(slotName, "-"))
+
+	filepath.Walk(slotPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		rel, _ := filepath.Rel(slotPath, path)
+		for _, skip := range []string{"node_modules", ".next", "dist", ".git"} {
+			if strings.Contains(rel, skip) {
+				return nil
+			}
+		}
+
+		if info.Name() != "docker-compose.yml" && info.Name() != "docker-compose.yaml" {
+			return nil
+		}
+
+		dir := filepath.Dir(path)
+		envPath := filepath.Join(dir, ".env")
+
+		// If .env or .env.local already exists, skip (updateSlotEnvFiles handled it)
+		if _, err := os.Stat(envPath); err == nil {
+			return nil
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".env.local")); err == nil {
+			return nil
+		}
+
+		envRel, _ := filepath.Rel(slotPath, envPath)
+
+		// Try .env.example or .env.sample as template
+		for _, tmpl := range []string{".env.example", ".env.sample"} {
+			tmplPath := filepath.Join(dir, tmpl)
+			if content, err := os.ReadFile(tmplPath); err == nil {
+				newContent := replacePortsInEnvContent(string(content), portMap, slotName)
+				os.WriteFile(envPath, []byte(newContent), 0644)
+				fmt.Printf("  Created: %s (from %s)\n", envRel, tmpl)
+				return nil
+			}
+		}
+
+		// No template - generate from docker-compose.yml ${VAR:-default} patterns
+		composeContent, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		varRe := regexp.MustCompile(`\$\{([A-Z_]+)(?::-(\d+))?\}`)
+		matches := varRe.FindAllStringSubmatch(string(composeContent), -1)
+
+		lines := []string{"COMPOSE_PROJECT_NAME=" + dockerName}
+		seen := map[string]bool{"COMPOSE_PROJECT_NAME": true}
+
+		for _, m := range matches {
+			varName := m[1]
+			if seen[varName] {
+				continue
+			}
+			seen[varName] = true
+
+			// If the default value matches a main port, write the slot port
+			if len(m) > 2 && m[2] != "" {
+				if defaultPort, err := strconv.Atoi(m[2]); err == nil {
+					if slotPort, ok := portMap[defaultPort]; ok {
+						lines = append(lines, fmt.Sprintf("%s=%d", varName, slotPort))
+					}
+				}
+			}
+		}
+
+		os.WriteFile(envPath, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+		fmt.Printf("  Created: %s (generated for docker-compose)\n", envRel)
 
 		return nil
 	})

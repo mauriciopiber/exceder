@@ -76,6 +76,8 @@
   },
   "window.commandCenter": true,
   "workbench.colorTheme": "One Dark Pro",
+  "workbench.sideBar.location": "left",
+  "cursor.autoHideSidebar": false,
   "workbench.activityBar.orientation": "vertical",
   "[postgres]": {
     "editor.defaultFormatter": "inferrinizzard.prettier-sql-vscode"
