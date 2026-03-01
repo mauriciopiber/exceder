@@ -3,7 +3,7 @@ pre-commit:
   jobs:
     - name: biome
       glob: "**/*.{ts,tsx,mts,js,jsx,json,css}"
-      run: npx biome check --staged --write
+      run: npx biome check --write {staged_files}
     - name: typecheck
       glob: "**/*.{ts,tsx,mts}"
       root: app/
